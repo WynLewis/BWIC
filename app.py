@@ -116,6 +116,42 @@ def _helpers(BwicLineMulti, io, load_intex_excel, price_bwic_line_multi):
     def fmt(v, decimals=1, suffix=""):
         return f"{v:.{decimals}f}{suffix}" if v is not None else "—"
 
+    def resolve_dealer(dropdown_val: str, other_val: str) -> str:
+        """Pick 'Other...' → custom text, else the dropdown value."""
+        if dropdown_val == "Other...":
+            return (other_val or "").strip()
+        return (dropdown_val or "").strip()
+
+    def bid_sanity(bwic, line_id, price, market_spread_bps, ba):
+        """Return list of warning strings for a candidate bid (empty if clean)."""
+        warnings = []
+        if bwic is None:
+            return warnings
+        try:
+            line = bwic.get_line(line_id)
+        except Exception:
+            return warnings
+        # Compare to running median of best bids on this line
+        best = line._best_bid_per_dealer()
+        prices = sorted(b.price for b in best.values())
+        if prices:
+            mid = prices[len(prices) // 2]
+            if abs(price - mid) > 0.50:
+                warnings.append(
+                    f"Bid is {abs(price - mid):.2f} pts from running median ({mid:.4f}) — typo?"
+                )
+        # Compare DM to market spread
+        if market_spread_bps and ba is not None:
+            try:
+                dm = ba.dm_from_price(price)
+                if abs(dm - market_spread_bps) > 200:
+                    warnings.append(
+                        f"DM {dm:.0f} is {abs(dm-market_spread_bps):.0f} bps off market ({market_spread_bps:.0f})"
+                    )
+            except Exception:
+                pass
+        return warnings
+
     def countdown(end_time, now):
         """Return (text, kind) for a countdown badge."""
         if end_time is None:
@@ -129,7 +165,7 @@ def _helpers(BwicLineMulti, io, load_intex_excel, price_bwic_line_multi):
         kind = "warn" if secs <= 60 else ("warn" if secs <= 300 else "success")
         return (f"⏳ {mm:02d}:{ss:02d}  remaining (closes {end_time.strftime('%H:%M:%S')})", kind)
 
-    return countdown, fmt, load_stream_from_bytes, price_line_at
+    return bid_sanity, countdown, fmt, load_stream_from_bytes, price_line_at, resolve_dealer
 
 
 # ============================================================================
@@ -207,6 +243,47 @@ def _header(get_state, mo):
     )
     _header_md
     return
+
+
+# ============================================================================
+# Save / Load BWIC state (pickle — preserves cashflow streams + Bwic object)
+# ============================================================================
+
+@app.cell
+def _save_load(get_state, mo, set_state):
+    import pickle, base64
+
+    _s = get_state()
+    _bwic_id_safe = (_s.get("bwic_id") or "bwic").replace(" ", "_")
+
+    # Serialize whole state (minus notifications + transient timers)
+    _to_save = {k: v for k, v in _s.items() if k not in ("notifications",)}
+    try:
+        _blob = pickle.dumps(_to_save)
+    except Exception:
+        _blob = b""
+
+    save_dl = mo.download(
+        data=_blob,
+        filename=f"{_bwic_id_safe}.bwic.pkl",
+        label="↓ Save BWIC state",
+    )
+
+    load_upload = mo.ui.file(filetypes=[".pkl"], label="↑ Load BWIC state (.pkl)")
+
+    def _do_load(_):
+        if not load_upload.value:
+            return
+        try:
+            loaded = pickle.loads(load_upload.value[0].contents)
+            # merge with current notifications cleared
+            set_state({**loaded, "notifications": []})
+        except Exception as exc:
+            set_state({**get_state(),
+                       "notifications": get_state()["notifications"] + [f"Load failed: {exc}"]})
+
+    load_btn = mo.ui.button(label="Apply loaded state", kind="success", on_click=_do_load)
+    return load_btn, load_upload, save_dl
 
 
 # ============================================================================
@@ -504,6 +581,8 @@ def _setup_section(
     demo_btn,
     face_inp,
     get_state,
+    load_btn,
+    load_upload,
     market_spread_inp,
     market_upload,
     mo,
@@ -517,6 +596,7 @@ def _setup_section(
     rating_inp,
     reinvest_end_inp,
     reserve_inp,
+    save_dl,
     seller_input,
     settle_inp,
     tranche_inp,
@@ -543,6 +623,10 @@ def _setup_section(
             mo.md("---"),
             mo.md("## 4 · Round timing"),
             mo.hstack([r1_dur_inp, r2_dur_inp], gap=2, justify="start"),
+            mo.md("---"),
+            mo.md("### Save / Load BWIC state"),
+            mo.hstack([save_dl, load_upload, load_btn], gap=2, justify="start"),
+            mo.md("---"),
             mo.hstack([open_r1_btn], justify="end"),
         ]
     )
@@ -572,12 +656,22 @@ def _notifications(get_state, mo):
 
 @app.cell
 def _bid_stable_inputs(mo):
-    dealer_inp = mo.ui.text(value="", label="Dealer", placeholder="GS, JPM, MS…")
+    # Common CLO BWIC counterparties — extend in code as your roster grows.
+    DEALER_ROSTER = [
+        "GS", "JPM", "MS", "BofA", "Citi", "Barclays", "DB", "Wells",
+        "BMO", "CS", "Nomura", "Jefferies", "Mizuho", "RBC", "BNP",
+        "SocGen", "HSBC", "Natixis", "MUFG", "Other...",
+    ]
+    dealer_dd = mo.ui.dropdown(
+        options=DEALER_ROSTER, value="GS",
+        label="Dealer",
+    )
+    dealer_other_inp = mo.ui.text(value="", label="Other dealer (when 'Other...' picked)")
     price_inp  = mo.ui.number(
         value=100.0, step=0.0625, start=50.0, stop=150.0,
         label="Bid Price (% par)",
     )
-    return dealer_inp, price_inp
+    return DEALER_ROSTER, dealer_dd, dealer_other_inp, price_inp
 
 
 # ============================================================================
@@ -586,8 +680,9 @@ def _bid_stable_inputs(mo):
 
 @app.cell
 def _r1_section(
-    BidError, countdown, datetime, dealer_inp, fmt, get_state, mo, pd,
-    price_inp, price_line_at, set_state, tick, timedelta,
+    BidError, BondAnalytics, bid_sanity, countdown, datetime, dealer_dd,
+    dealer_other_inp, fmt, get_state, mo, pd, price_inp, price_line_at,
+    resolve_dealer, set_state, tick, timedelta,
 ):
     _ = tick.value  # subscribe to 1Hz tick so the countdown re-renders
     _s = get_state()
@@ -631,14 +726,26 @@ def _r1_section(
             except Exception as _exc:
                 _dm_txt = f"Pricing error: {_exc}"
 
+    # ── Bid sanity warnings (live as user types price/line) ───────────────
+    _warn_lines = []
+    if _sel and _bwic:
+        _cfg_w = next((c for c in _lines if c["line_id"] == _sel), None)
+        if _cfg_w and _cfg_w.get("market_stream") is not None:
+            try:
+                _ba_w = BondAnalytics(_cfg_w["market_stream"])
+                _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg_w.get("market_spread"), _ba_w)
+            except Exception:
+                pass
+
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _submit(_):
         _st = get_state()
         _b  = _st.get("bwic")
-        if _b is None or not r1_line_sel.value or not dealer_inp.value.strip():
+        _dealer = resolve_dealer(dealer_dd.value, dealer_other_inp.value)
+        if _b is None or not r1_line_sel.value or not _dealer:
             return
         try:
-            _b.submit_bid(r1_line_sel.value, dealer_inp.value.strip(), price_inp.value)
+            _b.submit_bid(r1_line_sel.value, _dealer, price_inp.value)
             set_state({**_st, "bwic": _b, "notifications": []})
         except BidError as _e:
             set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
@@ -667,14 +774,24 @@ def _r1_section(
                 })
     _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
 
+    _warn_panel = (
+        mo.callout(
+            mo.vstack([mo.md(f"⚠️  {w}") for w in _warn_lines]),
+            kind="warn",
+        )
+        if _warn_lines else mo.md("")
+    )
+
     mo.vstack([
         mo.md("## Round 1 — Bid Intake"),
         mo.hstack([
             mo.callout(mo.md(_cd_text), kind=_cd_kind),
             _extend_r1_btn, tick,
         ], gap=1, justify="start"),
-        mo.hstack([r1_line_sel, dealer_inp, price_inp, _submit_btn], gap=1, justify="start"),
+        mo.hstack([r1_line_sel, dealer_dd, dealer_other_inp, price_inp, _submit_btn],
+                  gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
+        _warn_panel,
         mo.md("### Live bids"),
         mo.ui.table(_blotter_df, selection=None, page_size=30),
         mo.md("---"),
@@ -740,8 +857,9 @@ def _r1_results(datetime, get_state, mo, pd, r2_dur_inp, set_state, timedelta):
 
 @app.cell
 def _r2_section(
-    BidError, countdown, datetime, dealer_inp, fmt, get_state, mo, pd,
-    price_inp, price_line_at, set_state, tick, timedelta,
+    BidError, BondAnalytics, bid_sanity, countdown, datetime, dealer_dd,
+    dealer_other_inp, fmt, get_state, mo, pd, price_inp, price_line_at,
+    resolve_dealer, set_state, tick, timedelta,
 ):
     _ = tick.value
     _s = get_state()
@@ -792,14 +910,26 @@ def _r2_section(
             except Exception as _exc:
                 _dm_txt = f"Pricing error: {_exc}"
 
+    # ── Bid sanity warnings ───────────────────────────────────────────────
+    _warn_lines = []
+    if _sel and _bwic:
+        _cfg_w = next((c for c in _lines if c["line_id"] == _sel), None)
+        if _cfg_w and _cfg_w.get("market_stream") is not None:
+            try:
+                _ba_w = BondAnalytics(_cfg_w["market_stream"])
+                _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg_w.get("market_spread"), _ba_w)
+            except Exception:
+                pass
+
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _submit_r2(_):
         _st = get_state()
         _b  = _st.get("bwic")
-        if _b is None or not r2_line_sel.value or not dealer_inp.value.strip():
+        _dealer = resolve_dealer(dealer_dd.value, dealer_other_inp.value)
+        if _b is None or not r2_line_sel.value or not _dealer:
             return
         try:
-            _b.submit_bid(r2_line_sel.value, dealer_inp.value.strip(), price_inp.value)
+            _b.submit_bid(r2_line_sel.value, _dealer, price_inp.value)
             set_state({**_st, "bwic": _b, "notifications": []})
         except BidError as _e:
             set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
@@ -831,6 +961,14 @@ def _r2_section(
     # ── Advancing dealers reminder ─────────────────────────────────────────
     _adv_lines = [f"**{lid}**: {', '.join(adv)}" for lid, adv in _adv_map.items() if adv]
 
+    _warn_panel = (
+        mo.callout(
+            mo.vstack([mo.md(f"⚠️  {w}") for w in _warn_lines]),
+            kind="warn",
+        )
+        if _warn_lines else mo.md("")
+    )
+
     mo.vstack([
         mo.md("## Round 2 — Bid Intake"),
         mo.hstack([
@@ -838,8 +976,10 @@ def _r2_section(
             _extend_r2_btn, tick,
         ], gap=1, justify="start"),
         mo.callout(mo.md("Advancing dealers: " + " · ".join(_adv_lines)), kind="neutral"),
-        mo.hstack([r2_line_sel, dealer_inp, price_inp, _submit_btn], gap=1, justify="start"),
+        mo.hstack([r2_line_sel, dealer_dd, dealer_other_inp, price_inp, _submit_btn],
+                  gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
+        _warn_panel,
         mo.md("### R2 bids submitted"),
         mo.ui.table(_blotter_df, selection=None, page_size=30),
         mo.md("---"),
