@@ -592,6 +592,73 @@ def _pricing_table(BondAnalytics, get_state, mo, pd, price_line_at):
 
 
 # ============================================================================
+# Dealer roster manager (editable in the UI, persisted to dealers.json)
+# ============================================================================
+
+@app.cell
+def _roster_manager(mo):
+    import json as _rjson, os as _ros
+    _roster_path = _ros.path.join(_ros.path.dirname(__file__), "dealers.json")
+
+    def _load_roster():
+        try:
+            with open(_roster_path) as _f:
+                return _rjson.load(_f)
+        except Exception:
+            return ["GS","JPM","MS","BofA","Citi","Barclays","DB","Wells",
+                    "BMO","CS","Nomura","Jefferies","Mizuho","RBC","BNP",
+                    "SocGen","HSBC","Natixis","MUFG","Other..."]
+
+    def _save_roster(roster):
+        with open(_roster_path, "w") as _f:
+            _rjson.dump(roster, _f, indent=2)
+
+    _roster_now = _load_roster()
+
+    add_dealer_inp = mo.ui.text(value="", label="New dealer name", placeholder="e.g. Barclays")
+    remove_dealer_dd = mo.ui.dropdown(
+        options=_roster_now,
+        value=_roster_now[0] if _roster_now else None,
+        label="Remove dealer",
+    )
+
+    def _add_dealer(_):
+        name = (add_dealer_inp.value or "").strip()
+        if not name:
+            return
+        r = _load_roster()
+        if name not in r:
+            # Insert before "Other..." if present
+            if "Other..." in r:
+                r.insert(r.index("Other..."), name)
+            else:
+                r.append(name)
+            _save_roster(r)
+
+    def _remove_dealer(_):
+        name = remove_dealer_dd.value
+        if not name:
+            return
+        r = _load_roster()
+        if name in r:
+            r.remove(name)
+            _save_roster(r)
+
+    _add_dealer_btn    = mo.ui.button(label="Add →", kind="success", on_click=_add_dealer)
+    _remove_dealer_btn = mo.ui.button(label="Remove ×", kind="danger", on_click=_remove_dealer)
+
+    roster_manager_md = mo.accordion({
+        "👥 Manage dealer roster": mo.vstack([
+            mo.md(f"Current roster: {', '.join(_roster_now)}"),
+            mo.hstack([add_dealer_inp, _add_dealer_btn], gap=1, justify="start"),
+            mo.hstack([remove_dealer_dd, _remove_dealer_btn], gap=1, justify="start"),
+            mo.md("_Changes take effect on next form render (reload roster)._"),
+        ])
+    })
+    return (roster_manager_md,)
+
+
+# ============================================================================
 # Setup section layout
 # ============================================================================
 
@@ -621,6 +688,7 @@ def _setup_section(
     rating_inp,
     reinvest_end_inp,
     reserve_inp,
+    roster_manager_md,
     save_dl,
     seller_input,
     settle_inp,
@@ -651,6 +719,7 @@ def _setup_section(
             mo.md("---"),
             mo.md("### Save / Load BWIC state"),
             mo.hstack([save_dl, load_upload, load_btn], gap=2, justify="start"),
+            roster_manager_md,
             mo.md("---"),
             mo.hstack([open_r1_btn], justify="end"),
         ]
@@ -714,14 +783,48 @@ def _bid_stable_inputs(mo, get_clear):
 @app.cell
 def _r1_section(
     BidError, BondAnalytics, auto_clear_chk, bid_sanity, countdown,
-    datetime, dealer_dd, dealer_other_inp, fmt, get_clear, get_state,
-    mo, pd, price_inp, price_line_at, resolve_dealer, set_clear,
-    set_state, tick, timedelta,
+    datetime, dealer_dd, dealer_other_inp, fmt, get_alerts, get_clear,
+    get_state, mo, pd, price_inp, price_line_at, resolve_dealer,
+    set_alerts, set_clear, set_state, tick, timedelta,
 ):
     _ = tick.value  # subscribe to 1Hz tick so the countdown re-renders
     _s = get_state()
     mo.stop(_s["phase"] != "r1_open")
-    _cd_text, _cd_kind = countdown(_s.get("r1_end_time"), datetime.now())
+    _now = datetime.now()
+    _cd_text, _cd_kind = countdown(_s.get("r1_end_time"), _now)
+
+    # ── Audio/visual alerts at T-5min, T-1min, T-0 ────────────────────────
+    _alert_js = mo.Html("")
+    if _s.get("r1_end_time"):
+        _secs_left = int((_s["r1_end_time"] - _now).total_seconds())
+        _fired = get_alerts()
+        _thresholds = {300: ("R1", 300), 60: ("R1", 60), 0: ("R1", 0)}
+        for _thresh, _key in _thresholds.items():
+            if _secs_left <= _thresh and _key not in _fired:
+                _fired = _fired | {_key}
+                set_alerts(_fired)
+                _freq = 880 if _thresh == 0 else (660 if _thresh == 60 else 440)
+                _dur  = 600 if _thresh == 0 else 300
+                _alert_js = mo.Html(f"""
+<script>
+(function(){{
+  try {{
+    var ctx = new (window.AudioContext||window.webkitAudioContext)();
+    var o = ctx.createOscillator(); var g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = {_freq}; g.gain.value = 0.25;
+    o.start(); setTimeout(function(){{ o.stop(); ctx.close(); }}, {_dur});
+  }} catch(e) {{}}
+}})();
+</script>
+<style>
+@keyframes flash-warn {{ 0%,100%{{background:#fff}} 50%{{background:#ffe082}} }}
+.bwic-alert-flash {{ animation: flash-warn 0.5s ease 3; }}
+</style>
+<div class="bwic-alert-flash" style="padding:4px 8px;border-radius:4px;font-weight:bold;color:#b71c1c">
+  ⏰ R1 {'EXPIRED' if _thresh == 0 else f'T-{_thresh//60}min'} alert
+</div>""")
+                break
 
     def _extend_r1(_):
         _st = get_state()
@@ -876,6 +979,7 @@ def _r1_section(
 
     mo.vstack([
         mo.md("## Round 1 — Bid Intake"),
+        _alert_js,
         mo.hstack([
             mo.callout(mo.md(_cd_text), kind=_cd_kind),
             _extend_r1_btn, tick,
@@ -946,20 +1050,131 @@ def _r1_results(datetime, get_state, mo, pd, r2_dur_inp, set_state, timedelta):
 
 
 # ============================================================================
+# WAL sensitivity — re-prices the demo stream under 4 CPR scenarios
+# ============================================================================
+
+@app.cell
+def _wal_sensitivity(BondAnalytics, build_demo_stream, get_state, mo, pd, price_line_at):
+    _s = get_state()
+    mo.stop(_s["phase"] not in ("r1_closed", "r2_open", "awarded"))
+    _lines = _s["lines_config"]
+    mo.stop(not _lines)
+
+    _cpr_scenarios = [
+        ("10 CPR (fast)", 10),
+        ("15 CPR (base)", 15),
+        ("20 CPR (market)", 20),
+        ("25 CPR (stress)", 25),
+    ]
+
+    _wal_rows = []
+    for _cfg in _lines:
+        # If this is a demo line (stream was built with build_demo_stream), rebuild at each CPR.
+        # For real Intex streams we can only show the already-projected WAL.
+        _qs = _cfg.get("quoted_spread", 115) or 115
+        _reinvest_months = 48  # default for demo
+
+        _row = {
+            "Line":    _cfg["line_id"],
+            "Deal":    _cfg.get("deal_name", ""),
+            "Rating":  _cfg.get("rating", ""),
+            "Tranche": _cfg.get("tranche", ""),
+        }
+
+        for _lbl, _cpr in _cpr_scenarios:
+            # Approximate amort months from CPR: faster prepay → shorter amort window
+            _amort_months = max(6, int(24 * (20 / max(_cpr, 1))))
+            try:
+                _s_cpr = build_demo_stream(
+                    spread_bps=int(_qs),
+                    reinvest_months=_reinvest_months,
+                    amort_months=_amort_months,
+                )
+                _ba = BondAnalytics(_s_cpr)
+                _w  = _ba.wal()
+                _row[f"WAL @ {_cpr}"] = round(_w, 2)
+                # DM at par for this scenario
+                _dm = _ba.dm_from_price(100.0)
+                _row[f"DM @ {_cpr}"] = round(_dm, 1) if _dm > -9999 else None
+            except Exception:
+                _row[f"WAL @ {_cpr}"] = None
+                _row[f"DM @ {_cpr}"] = None
+
+        # Also show actual WAL from uploaded Market stream if available
+        _mkt = _cfg.get("market_stream")
+        if _mkt is not None:
+            try:
+                _ba_m = BondAnalytics(_mkt)
+                _row["WAL (Intex mkt)"] = round(_ba_m.wal(), 2)
+            except Exception:
+                _row["WAL (Intex mkt)"] = None
+
+        _wal_rows.append(_row)
+
+    _wal_df = pd.DataFrame(_wal_rows) if _wal_rows else pd.DataFrame()
+
+    mo.accordion({
+        "📈 WAL sensitivity (CPR scenarios — demo engine)": (
+            mo.vstack([
+                mo.md("WAL and DM-at-par estimated via synthetic amortization at each CPR rate.  "
+                      "Real Intex streams show actual projected WAL under 'WAL (Intex mkt)'."),
+                mo.ui.table(_wal_df, selection=None, page_size=20),
+            ])
+            if not _wal_df.empty else mo.md("_(no lines)_")
+        )
+    })
+    return
+
+
+# ============================================================================
 # Round 2 — bid entry, live DM preview, blotter, close button
 # ============================================================================
 
 @app.cell
 def _r2_section(
     BidError, BondAnalytics, auto_clear_chk, bid_sanity, countdown,
-    datetime, dealer_dd, dealer_other_inp, fmt, get_clear, get_state,
-    mo, pd, price_inp, price_line_at, resolve_dealer, set_clear,
-    set_state, tick, timedelta,
+    datetime, dealer_dd, dealer_other_inp, fmt, get_alerts, get_clear,
+    get_state, mo, pd, price_inp, price_line_at, resolve_dealer,
+    set_alerts, set_clear, set_state, tick, timedelta,
 ):
     _ = tick.value
     _s = get_state()
     mo.stop(_s["phase"] != "r2_open")
-    _cd_text, _cd_kind = countdown(_s.get("r2_end_time"), datetime.now())
+    _now = datetime.now()
+    _cd_text, _cd_kind = countdown(_s.get("r2_end_time"), _now)
+
+    # ── Audio/visual alerts at T-5min, T-1min, T-0 ────────────────────────
+    _alert_js = mo.Html("")
+    if _s.get("r2_end_time"):
+        _secs_left = int((_s["r2_end_time"] - _now).total_seconds())
+        _fired = get_alerts()
+        _thresholds = {300: ("R2", 300), 60: ("R2", 60), 0: ("R2", 0)}
+        for _thresh, _key in _thresholds.items():
+            if _secs_left <= _thresh and _key not in _fired:
+                _fired = _fired | {_key}
+                set_alerts(_fired)
+                _freq = 880 if _thresh == 0 else (660 if _thresh == 60 else 440)
+                _dur  = 600 if _thresh == 0 else 300
+                _alert_js = mo.Html(f"""
+<script>
+(function(){{
+  try {{
+    var ctx = new (window.AudioContext||window.webkitAudioContext)();
+    var o = ctx.createOscillator(); var g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = {_freq}; g.gain.value = 0.25;
+    o.start(); setTimeout(function(){{ o.stop(); ctx.close(); }}, {_dur});
+  }} catch(e) {{}}
+}})();
+</script>
+<style>
+@keyframes flash-warn {{ 0%,100%{{background:#fff}} 50%{{background:#ffe082}} }}
+.bwic-alert-flash {{ animation: flash-warn 0.5s ease 3; }}
+</style>
+<div class="bwic-alert-flash" style="padding:4px 8px;border-radius:4px;font-weight:bold;color:#b71c1c">
+  ⏰ R2 {'EXPIRED' if _thresh == 0 else f'T-{_thresh//60}min'} alert
+</div>""")
+                break
 
     def _extend_r2(_):
         _st = get_state()
@@ -1120,6 +1335,7 @@ def _r2_section(
 
     mo.vstack([
         mo.md("## Round 2 — Bid Intake"),
+        _alert_js,
         mo.hstack([
             mo.callout(mo.md(_cd_text), kind=_cd_kind),
             _extend_r2_btn, tick,
@@ -1203,7 +1419,7 @@ def _award_section(get_state, mo, pd, set_state):
             lambda t: t.strftime("%Y-%m-%d %H:%M:%S") if hasattr(t, "strftime") else str(t)
         )
 
-    # ── Downloads ──────────────────────────────────────────────────────────
+    # ── CSV downloads ──────────────────────────────────────────────────────
     _bwic_id_safe = (_s.get("bwic_id") or "bwic").replace(" ", "_")
     _color_csv = _color_df.to_csv(index=False).encode("utf-8") if not _color_df.empty else b""
     _bidlog_csv = _bid_log_df.to_csv(index=False).encode("utf-8") if not _bid_log_df.empty else b""
@@ -1218,6 +1434,176 @@ def _award_section(get_state, mo, pd, set_state):
         filename=f"{_bwic_id_safe}_bid_log.csv",
         label="↓ Bid log (CSV)",
     )
+
+    # ── Excel export (openpyxl — conditional formatting) ──────────────────
+    def _build_excel():
+        import io as _io
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, numbers
+        from openpyxl.formatting.rule import ColorScaleRule
+        wb = openpyxl.Workbook()
+        # Sheet 1: Color sheet
+        ws1 = wb.active
+        ws1.title = "Color Sheet"
+        if not _color_df.empty:
+            ws1.append(list(_color_df.columns))
+            for _, r in _color_df.iterrows():
+                ws1.append([r[c] for c in _color_df.columns])
+            # Color-scale on dm_cover column if present
+            if "dm_cover" in _color_df.columns:
+                _col_idx = list(_color_df.columns).index("dm_cover") + 1
+                _col_letter = openpyxl.utils.get_column_letter(_col_idx)
+                _last_row = len(_color_df) + 1
+                ws1.conditional_formatting.add(
+                    f"{_col_letter}2:{_col_letter}{_last_row}",
+                    ColorScaleRule(
+                        start_type="min", start_color="63BE7B",
+                        mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                        end_type="max", end_color="F8696B",
+                    ),
+                )
+        # Sheet 2: Bid log
+        ws2 = wb.create_sheet("Bid Log")
+        if not _bid_log_df.empty:
+            ws2.append(list(_bid_log_df.columns))
+            for _, r in _bid_log_df.iterrows():
+                ws2.append([r[c] for c in _bid_log_df.columns])
+        # Sheet 3: Award summary
+        ws3 = wb.create_sheet("Awards")
+        _aw_header = ["Line","Tranche","Award Dealer","Award Price","DM Award","Cover Dealer","Cover Price","DM Cover","DNT"]
+        ws3.append(_aw_header)
+        for _line in _bwic.lines:
+            if _line.award:
+                _a = _line.award
+                ws3.append([
+                    _line.line_id, _line.tranche_name,
+                    _a.award_dealer, _a.award_price, _a.spread_at_award,
+                    _a.cover_dealer, _a.cover_price, _a.spread_at_cover,
+                    "Yes" if _a.is_dnt else "No",
+                ])
+        buf = _io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    try:
+        _excel_bytes = _build_excel()
+    except Exception as _xex:
+        _excel_bytes = b""
+    _excel_dl = mo.download(
+        data=_excel_bytes,
+        filename=f"{_bwic_id_safe}_bwic.xlsx",
+        label="↓ BWIC workbook (XLSX)",
+    )
+
+    # ── PDF one-pager (reportlab) ─────────────────────────────────────────
+    def _build_pdf():
+        import io as _io
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        buf = _io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=letter,
+                                leftMargin=0.75*inch, rightMargin=0.75*inch,
+                                topMargin=0.75*inch, bottomMargin=0.75*inch)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Title
+        story.append(Paragraph(f"BWIC Award Sheet — {_s.get('bwic_id','')}", styles["Title"]))
+        story.append(Paragraph(f"Seller: {_s.get('seller','')} | Date: {_bwic.bwic_date}", styles["Normal"]))
+        story.append(Spacer(1, 0.2*inch))
+
+        # Award table
+        _pdf_data = [["Line","Tranche","Face $MM","Award Dealer","Price","DM (bps)","Cover Dealer","Cover Price","DM Cover","vs Mkt"]]
+        for _line in _bwic.lines:
+            _a = _line.award
+            if _a is None:
+                continue
+            _cf = _cfg_by_id.get(_line.line_id, {})
+            _mkt = _cf.get("market_spread")
+            _face_mm = f"{_line.current_face/1e6:.0f}"
+            if _a.is_dnt:
+                _pdf_data.append([_line.line_id, _line.tranche_name, _face_mm,
+                                   "DNT", "—", "—", "—", "—", "—", "—"])
+            else:
+                _vs = ""
+                if _a.spread_at_award is not None and _mkt:
+                    _d = _mkt - _a.spread_at_award
+                    _vs = f"{_d:+.1f}"
+                _pdf_data.append([
+                    _line.line_id, _line.tranche_name, _face_mm,
+                    _a.award_dealer or "—",
+                    f"{_a.award_price:.4f}" if _a.award_price else "—",
+                    f"{_a.spread_at_award:.1f}" if _a.spread_at_award else "—",
+                    _a.cover_dealer or "—",
+                    f"{_a.cover_price:.4f}" if _a.cover_price else "—",
+                    f"{_a.spread_at_cover:.1f}" if _a.spread_at_cover else "—",
+                    _vs,
+                ])
+        tbl = Table(_pdf_data, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#2D5986")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#EEF4FB")]),
+            ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 0.15*inch))
+        story.append(Paragraph("Confidential — for compliance archive only.", styles["Italic"]))
+        doc.build(story)
+        return buf.getvalue()
+
+    try:
+        _pdf_bytes = _build_pdf()
+    except Exception as _pex:
+        _pdf_bytes = b""
+    _pdf_dl = mo.download(
+        data=_pdf_bytes,
+        filename=f"{_bwic_id_safe}_award.pdf",
+        label="↓ Award one-pager (PDF)",
+    )
+
+    # ── Dealer participation stats (append to dealer_stats.jsonl) ─────────
+    import os as _dsos, json as _dsjson
+    _stats_path = _dsos.path.join(_dsos.path.dirname(__file__), "dealer_stats.jsonl")
+    _bwic_id_str = _s.get("bwic_id") or "?"
+
+    def _log_stats(_):
+        _st = get_state()
+        _b = _st.get("bwic")
+        if _b is None:
+            return
+        _entry = {
+            "bwic_id": _bwic_id_str,
+            "date": str(_b.bwic_date),
+            "dealers": {},
+        }
+        for _l in _b.lines:
+            _best = _l._best_bid_per_dealer()
+            for _dlr, _bid in _best.items():
+                rec = _entry["dealers"].setdefault(_dlr, {"bids": 0, "won": 0, "covered": 0, "face_bid": 0, "face_won": 0})
+                rec["bids"] += 1
+                rec["face_bid"] += _l.current_face
+                if _l.award and not _l.award.is_dnt:
+                    if _l.award.award_dealer == _dlr:
+                        rec["won"] += 1
+                        rec["face_won"] += _l.current_face
+                    elif _l.award.cover_dealer == _dlr:
+                        rec["covered"] += 1
+        try:
+            with open(_stats_path, "a") as _sf:
+                _sf.write(_dsjson.dumps(_entry) + "\n")
+            set_state({**_st, "notifications": _st["notifications"] + [f"Dealer stats logged to dealer_stats.jsonl"]})
+        except Exception as _e:
+            set_state({**_st, "notifications": _st["notifications"] + [f"Stats log failed: {_e}"]})
+
+    _log_stats_btn = mo.ui.button(label="Log dealer stats", kind="neutral", on_click=_log_stats)
 
     # ── Reset BWIC ─────────────────────────────────────────────────────────
     def _reset(_):
@@ -1242,10 +1628,64 @@ def _award_section(get_state, mo, pd, set_state):
         mo.ui.table(_bid_log_df, selection=None, page_size=50) if not _bid_log_df.empty
             else mo.md("_(no bids)_"),
         mo.md("### Export"),
-        mo.hstack([_color_dl, _bidlog_dl], gap=1, justify="start"),
+        mo.hstack([_color_dl, _bidlog_dl, _excel_dl, _pdf_dl], gap=1, justify="start"),
+        mo.hstack([_log_stats_btn], justify="start"),
         mo.md("---"),
         mo.hstack([_reset_btn], justify="end"),
     ])
+    return
+
+
+# ============================================================================
+# Dealer participation stats viewer
+# ============================================================================
+
+@app.cell
+def _dealer_stats_view(mo, pd):
+    import os as _stos, json as _stjson
+    _stats_path = _stos.path.join(_stos.path.dirname(__file__), "dealer_stats.jsonl")
+
+    _all_records = []
+    try:
+        with open(_stats_path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line:
+                    _all_records.append(_stjson.loads(_line))
+    except FileNotFoundError:
+        pass
+
+    _stats_rows = []
+    if _all_records:
+        _agg: dict = {}
+        for _rec in _all_records:
+            for _dlr, _d in _rec.get("dealers", {}).items():
+                r = _agg.setdefault(_dlr, {"Dealer": _dlr, "BWICs": 0, "Lines Bid": 0, "Won": 0, "Covered": 0, "Face Bid $MM": 0.0, "Face Won $MM": 0.0})
+                r["BWICs"] += 1
+                r["Lines Bid"] += _d.get("bids", 0)
+                r["Won"] += _d.get("won", 0)
+                r["Covered"] += _d.get("covered", 0)
+                r["Face Bid $MM"] += _d.get("face_bid", 0) / 1e6
+                r["Face Won $MM"] += _d.get("face_won", 0) / 1e6
+        for _dlr, r in _agg.items():
+            r["Win Rate"] = f"{100*r['Won']/max(r['Lines Bid'],1):.1f}%"
+            r["Face Bid $MM"] = round(r["Face Bid $MM"], 1)
+            r["Face Won $MM"] = round(r["Face Won $MM"], 1)
+            _stats_rows.append(r)
+        _stats_rows.sort(key=lambda x: -x["Won"])
+
+    _stats_df = pd.DataFrame(_stats_rows) if _stats_rows else pd.DataFrame()
+
+    mo.accordion({
+        "📊 Dealer participation stats (lifetime)": (
+            mo.vstack([
+                mo.md(f"_{len(_all_records)} BWIC(s) on record._"),
+                mo.ui.table(_stats_df, selection=None, page_size=30),
+            ])
+            if not _stats_df.empty
+            else mo.md("_No stats yet — click 'Log dealer stats' after awarding a BWIC._")
+        )
+    })
     return
 
 
