@@ -27,7 +27,7 @@ def _imports():
 
     import marimo as mo
     import pandas as pd
-    from datetime import date
+    from datetime import date, datetime, timedelta
 
     from graam.bwic_workflow import Bwic, BwicLine as WfBwicLine, LineState, BidError
     from graam.bwic_pricing import price_bwic_line_multi, BwicLineMulti
@@ -48,11 +48,13 @@ def _imports():
         LineState,
         WfBwicLine,
         date,
+        datetime,
         io,
         load_intex_excel,
         mo,
         pd,
         price_bwic_line_multi,
+        timedelta,
     )
 
 
@@ -70,6 +72,8 @@ def _state(mo):
             "bwic": None,         # graam.bwic_workflow.Bwic — created on Open R1
             "phase": "setup",     # setup | r1_open | r1_closed | r2_open | awarded
             "notifications": [],
+            "r1_end_time": None,  # datetime — when R1 should close (for countdown display)
+            "r2_end_time": None,
         }
     )
     return get_state, set_state
@@ -112,7 +116,20 @@ def _helpers(BwicLineMulti, io, load_intex_excel, price_bwic_line_multi):
     def fmt(v, decimals=1, suffix=""):
         return f"{v:.{decimals}f}{suffix}" if v is not None else "—"
 
-    return fmt, load_stream_from_bytes, price_line_at
+    def countdown(end_time, now):
+        """Return (text, kind) for a countdown badge."""
+        if end_time is None:
+            return ("Timer not set", "neutral")
+        secs = int((end_time - now).total_seconds())
+        if secs <= 0:
+            over = -secs
+            mm, ss = divmod(over, 60)
+            return (f"⏰ EXPIRED  ({mm:02d}:{ss:02d} over)", "danger")
+        mm, ss = divmod(secs, 60)
+        kind = "warn" if secs <= 60 else ("warn" if secs <= 300 else "success")
+        return (f"⏳ {mm:02d}:{ss:02d}  remaining (closes {end_time.strftime('%H:%M:%S')})", kind)
+
+    return countdown, fmt, load_stream_from_bytes, price_line_at
 
 
 # ============================================================================
@@ -193,6 +210,24 @@ def _header(get_state, mo):
 
 
 # ============================================================================
+# Round duration inputs + 1Hz tick for countdown displays
+# ============================================================================
+
+@app.cell
+def _round_duration_inputs(mo):
+    r1_dur_inp = mo.ui.number(value=30, start=1, stop=240, step=1, label="R1 duration (min)")
+    r2_dur_inp = mo.ui.number(value=15, start=1, stop=240, step=1, label="R2 duration (min)")
+    return r1_dur_inp, r2_dur_inp
+
+
+@app.cell
+def _ticker(mo):
+    # 1-second refresh — display cells that depend on tick.value re-run each second
+    tick = mo.ui.refresh(default_interval="1s", options=["1s", "5s", "off"])
+    return (tick,)
+
+
+# ============================================================================
 # Stable form inputs (don't depend on mutable state — values persist)
 # ============================================================================
 
@@ -234,15 +269,18 @@ def _setup_actions(
     bwic_id_input,
     cusip_inp,
     date,
+    datetime,
     face_inp,
     get_state,
     load_stream_from_bytes,
     market_upload,
     mo,
     nc_date_inp,
+    r1_dur_inp,
     reserve_inp,
     seller_input,
     set_state,
+    timedelta,
     tranche_inp,
 ):
     def _add_line(_):
@@ -341,7 +379,8 @@ def _setup_actions(
             )
             bwic.add_line(line)
         bwic.open_round1()
-        set_state({**s, "bwic": bwic, "phase": "r1_open"})
+        _r1_end = datetime.now() + timedelta(minutes=int(r1_dur_inp.value or 30))
+        set_state({**s, "bwic": bwic, "phase": "r1_open", "r1_end_time": _r1_end})
 
     add_line_btn   = mo.ui.button(label="+ Add Line",                      kind="success", on_click=_add_line)
     demo_btn       = mo.ui.button(label="Load Demo (AAA $100M S+115)",     kind="neutral", on_click=_load_demo)
@@ -415,6 +454,8 @@ def _setup_section(
     nc_date_inp,
     open_r1_btn,
     pricing_table_md,
+    r1_dur_inp,
+    r2_dur_inp,
     reserve_inp,
     seller_input,
     tranche_inp,
@@ -433,6 +474,8 @@ def _setup_section(
             mo.md("## 3 · Pricing reference"),
             pricing_table_md,
             mo.md("---"),
+            mo.md("## 4 · Round timing"),
+            mo.hstack([r1_dur_inp, r2_dur_inp], gap=2, justify="start"),
             mo.hstack([open_r1_btn], justify="end"),
         ]
     )
@@ -476,10 +519,20 @@ def _bid_stable_inputs(mo):
 
 @app.cell
 def _r1_section(
-    BidError, dealer_inp, fmt, get_state, mo, pd, price_inp, price_line_at, set_state,
+    BidError, countdown, datetime, dealer_inp, fmt, get_state, mo, pd,
+    price_inp, price_line_at, set_state, tick, timedelta,
 ):
+    _ = tick.value  # subscribe to 1Hz tick so the countdown re-renders
     _s = get_state()
     mo.stop(_s["phase"] != "r1_open")
+    _cd_text, _cd_kind = countdown(_s.get("r1_end_time"), datetime.now())
+
+    def _extend_r1(_):
+        _st = get_state()
+        _end = _st.get("r1_end_time") or datetime.now()
+        set_state({**_st, "r1_end_time": _end + timedelta(minutes=5)})
+
+    _extend_r1_btn = mo.ui.button(label="+5 min", kind="neutral", on_click=_extend_r1)
 
     _bwic   = _s["bwic"]
     _lines  = _s["lines_config"]
@@ -549,6 +602,10 @@ def _r1_section(
 
     mo.vstack([
         mo.md("## Round 1 — Bid Intake"),
+        mo.hstack([
+            mo.callout(mo.md(_cd_text), kind=_cd_kind),
+            _extend_r1_btn, tick,
+        ], gap=1, justify="start"),
         mo.hstack([r1_line_sel, dealer_inp, price_inp, _submit_btn], gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
         mo.md("### Live bids"),
@@ -564,7 +621,7 @@ def _r1_section(
 # ============================================================================
 
 @app.cell
-def _r1_results(get_state, mo, pd, set_state):
+def _r1_results(datetime, get_state, mo, pd, r2_dur_inp, set_state, timedelta):
     _s = get_state()
     mo.stop(_s["phase"] != "r1_closed")
 
@@ -577,7 +634,8 @@ def _r1_results(get_state, mo, pd, set_state):
             return
         try:
             _b.open_round2()
-            set_state({**_st, "bwic": _b, "phase": "r2_open"})
+            _r2_end = datetime.now() + timedelta(minutes=int(r2_dur_inp.value or 15))
+            set_state({**_st, "bwic": _b, "phase": "r2_open", "r2_end_time": _r2_end})
         except Exception as _exc:
             set_state({**_st, "notifications": _st["notifications"] + [str(_exc)]})
 
@@ -615,10 +673,20 @@ def _r1_results(get_state, mo, pd, set_state):
 
 @app.cell
 def _r2_section(
-    BidError, dealer_inp, fmt, get_state, mo, pd, price_inp, price_line_at, set_state,
+    BidError, countdown, datetime, dealer_inp, fmt, get_state, mo, pd,
+    price_inp, price_line_at, set_state, tick, timedelta,
 ):
+    _ = tick.value
     _s = get_state()
     mo.stop(_s["phase"] != "r2_open")
+    _cd_text, _cd_kind = countdown(_s.get("r2_end_time"), datetime.now())
+
+    def _extend_r2(_):
+        _st = get_state()
+        _end = _st.get("r2_end_time") or datetime.now()
+        set_state({**_st, "r2_end_time": _end + timedelta(minutes=5)})
+
+    _extend_r2_btn = mo.ui.button(label="+5 min", kind="neutral", on_click=_extend_r2)
 
     _bwic  = _s["bwic"]
     _lines = _s["lines_config"]
@@ -698,6 +766,10 @@ def _r2_section(
 
     mo.vstack([
         mo.md("## Round 2 — Bid Intake"),
+        mo.hstack([
+            mo.callout(mo.md(_cd_text), kind=_cd_kind),
+            _extend_r2_btn, tick,
+        ], gap=1, justify="start"),
         mo.callout(mo.md("Advancing dealers: " + " · ".join(_adv_lines)), kind="neutral"),
         mo.hstack([r2_line_sel, dealer_inp, price_inp, _submit_btn], gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
@@ -796,6 +868,159 @@ def _award_section(get_state, mo, pd, set_state):
         mo.hstack([_color_dl, _bidlog_dl], gap=1, justify="start"),
         mo.md("---"),
         mo.hstack([_reset_btn], justify="end"),
+    ])
+    return
+
+
+# ============================================================================
+# Bloomberg IB messages — copy/paste these into IB chat during the BWIC
+# ============================================================================
+
+@app.cell
+def _ib_messages(date, datetime, get_state, mo, pd):
+    _s = get_state()
+    _bwic = _s.get("bwic")
+    _phase = _s["phase"]
+    _bwic_id = _s.get("bwic_id") or "BWIC"
+    _seller = _s.get("seller") or "Seller"
+
+    def _fmt_face(face):
+        if face >= 1_000_000:
+            return f"{face/1_000_000:.0f}MM"
+        return f"{face:,.0f}"
+
+    def _fmt_dt(dt):
+        return dt.strftime("%H:%M EST") if dt else "TBD"
+
+    # ── 1. ANNOUNCEMENT (sent before R1 opens — covers full lineup) ────────
+    _lines_cfg = _s["lines_config"]
+    _today_str = date.today().strftime("%a %m/%d/%y")
+    _r1_when = _fmt_dt(_s.get("r1_end_time"))
+    _r2_when = _fmt_dt(_s.get("r2_end_time"))
+
+    _announce_lines = [
+        f"*** BWIC ANNOUNCEMENT — {_today_str} ***",
+        f"Seller:  {_seller}",
+        f"BWIC ID: {_bwic_id}",
+        "",
+        f"R1 due:  {_r1_when}  (top 3 advance, ties move)",
+        f"R2 due:  {_r2_when}  (last & best)",
+        "Color:   post-trade, T+0",
+        "",
+        "LINEUP:",
+    ]
+    for _i, _c in enumerate(_lines_cfg, 1):
+        _nc = _c.get("nc_date").strftime("%m/%y") if _c.get("nc_date") else "n/a"
+        _res = f"{_c['reserve']:.4f}" if _c.get("reserve") else "NONE"
+        _announce_lines.append(
+            f"  {_i}) {_c.get('cusip','')} {_c.get('tranche','')} "
+            f"${_fmt_face(_c.get('face') or 0)} | NC {_nc} | Reserve: {_res}"
+        )
+    _announce_lines += [
+        "",
+        "Format: direct via IB, all-in price (% par).",
+        "Bids subject to seller discretion. Cover/color out post-trade.",
+    ]
+    announce_msg = "\n".join(_announce_lines)
+
+    # ── 2. R1 OPEN ─────────────────────────────────────────────────────────
+    r1_open_msg = "\n".join([
+        f"*** R1 OPEN — {_bwic_id} ***",
+        f"Bids due {_r1_when}.",
+        "Direct via IB, all-in price.",
+        "Top 3 advance to R2 (ties move).",
+    ])
+
+    # ── 3. R1 CLOSED / advancers ───────────────────────────────────────────
+    _r1_close_lines = [f"*** R1 CLOSED — {_bwic_id} ***", ""]
+    if _bwic and _phase in ("r1_closed", "r2_open", "awarded"):
+        _r1_close_lines.append("Advancing to R2:")
+        for _line in _bwic.lines:
+            _r1_close_lines.append(
+                f"  {_line.line_id} {_line.tranche_name}: "
+                + (", ".join(_line.advancing_dealers) if _line.advancing_dealers else "—")
+            )
+        _r1_close_lines += ["", f"R2 opens shortly — last & best by {_r2_when}."]
+    else:
+        _r1_close_lines.append("(R1 not yet closed)")
+    r1_closed_msg = "\n".join(_r1_close_lines)
+
+    # ── 4. R2 OPEN ─────────────────────────────────────────────────────────
+    r2_open_msg = "\n".join([
+        f"*** R2 OPEN — Last & Best ***",
+        f"You are advancing.  Last & best due {_r2_when}.",
+        "You may stay flat — cannot lower.",
+        "Direct via IB, all-in price.",
+    ])
+
+    # ── 5. COLOR (post-award) ──────────────────────────────────────────────
+    _color_lines = [f"*** COLOR — {_bwic_id} ***", ""]
+    if _bwic and _phase == "awarded":
+        for _line in _bwic.lines:
+            _aw = _line.award
+            if _aw is None:
+                continue
+            _hdr = f"{_line.line_id} {_line.tranche_name} ${_fmt_face(_line.current_face)}"
+            if _aw.is_dnt:
+                _color_lines.append(f"{_hdr}: DNT — {_aw.dnt_reason}")
+                continue
+            _best = _line._best_bid_per_dealer()
+            _prices = sorted([b.price for b in _best.values()], reverse=True)
+            _color_lines.append(f"{_hdr}:")
+            _color_lines.append(
+                f"  TRADED @ {_aw.award_price:.4f}"
+                + (f"  (DM {_aw.spread_at_award:.1f})" if _aw.spread_at_award is not None else "")
+            )
+            if _aw.cover_dealer:
+                _color_lines.append(
+                    f"  Cover  @ {_aw.cover_price:.4f}"
+                    + (f"  (DM {_aw.spread_at_cover:.1f})" if _aw.spread_at_cover is not None else "")
+                )
+            _color_lines.append(
+                f"  Range  {_prices[-1]:.4f} – {_prices[0]:.4f} | {len(_best)} bids"
+            )
+            _color_lines.append("")
+        _color_lines.append("Thanks for participating.")
+    else:
+        _color_lines.append("(Color available once awarded.)")
+    color_msg = "\n".join(_color_lines)
+
+    # ── Phase-aware "active" message label ─────────────────────────────────
+    _active_label = {
+        "setup":     "Pre-launch announcement",
+        "r1_open":   "Round 1 open",
+        "r1_closed": "Round 1 closed — advancers",
+        "r2_open":   "Round 2 — last & best",
+        "awarded":   "Color (post-trade)",
+    }.get(_phase, "Announcement")
+
+    _active_msg = {
+        "setup":     announce_msg,
+        "r1_open":   r1_open_msg,
+        "r1_closed": r1_closed_msg,
+        "r2_open":   r2_open_msg,
+        "awarded":   color_msg,
+    }.get(_phase, announce_msg)
+
+    _all_messages_md = mo.accordion({
+        "📣 1 · BWIC announcement (pre-launch)": mo.md(f"```text\n{announce_msg}\n```"),
+        "🔔 2 · Round 1 open":                    mo.md(f"```text\n{r1_open_msg}\n```"),
+        "📋 3 · R1 closed — advancers":           mo.md(f"```text\n{r1_closed_msg}\n```"),
+        "🎯 4 · Round 2 last & best":             mo.md(f"```text\n{r2_open_msg}\n```"),
+        "📊 5 · Color (post-award)":              mo.md(f"```text\n{color_msg}\n```"),
+    })
+
+    mo.vstack([
+        mo.md("## 📨 Bloomberg IB messages"),
+        mo.callout(
+            mo.vstack([
+                mo.md(f"**Active message** — _{_active_label}_"),
+                mo.md(f"```text\n{_active_msg}\n```"),
+            ]),
+            kind="success",
+        ),
+        mo.md("### All messages"),
+        _all_messages_md,
     ])
     return
 
