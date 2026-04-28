@@ -858,6 +858,17 @@ def _award_section(get_state, mo, pd, set_state):
     mo.stop(_s["phase"] != "awarded")
 
     _bwic = _s["bwic"]
+    _cfg_by_id = {c["line_id"]: c for c in _s.get("lines_config", [])}
+
+    def _vs_market(dm_bps, market_bps):
+        if dm_bps is None or not market_bps:
+            return ""
+        d = market_bps - dm_bps
+        if abs(d) < 0.05:
+            return "  (at market)"
+        sign = "+" if d > 0 else "−"
+        word = "tighter than" if d > 0 else "wider than"
+        return f"  ({sign}{abs(d):.1f} bps {word} mkt {market_bps:.0f})"
 
     # ── Award cards (one per line) ─────────────────────────────────────────
     _cards = []
@@ -865,20 +876,28 @@ def _award_section(get_state, mo, pd, set_state):
         _aw = _line.award
         if _aw is None:
             continue
+        _cfg = _cfg_by_id.get(_line.line_id, {})
+        _hdr = (
+            f"### {_line.line_id} · {_cfg.get('deal_name', '')} "
+            f"{_cfg.get('rating', '')} {_line.tranche_name}"
+        )
         if _aw.is_dnt:
             _cards.append(mo.callout(
-                mo.md(f"### {_line.line_id} · {_line.tranche_name}\n\n**DNT** — {_aw.dnt_reason}"),
+                mo.md(f"{_hdr}\n\n**DNT** — {_aw.dnt_reason}"),
                 kind="danger",
             ))
             continue
+        _mkt = _cfg.get("market_spread")
         _award_md = (
-            f"### {_line.line_id} · {_line.tranche_name}  \n"
+            f"{_hdr}  \n"
             f"**🏆 AWARD** · {_aw.award_dealer} @ **{_aw.award_price:.4f}**"
-            + (f"  (DM {_aw.spread_at_award:.1f} bps)" if _aw.spread_at_award is not None else "")
+            + (f"  (DM {_aw.spread_at_award:.1f} bps{_vs_market(_aw.spread_at_award, _mkt)})"
+               if _aw.spread_at_award is not None else "")
             + "  \n"
             f"**📊 COVER** · "
             + (f"{_aw.cover_dealer} @ {_aw.cover_price:.4f}" if _aw.cover_dealer else "_no cover_")
-            + (f"  (DM {_aw.spread_at_cover:.1f} bps)" if _aw.spread_at_cover is not None else "")
+            + (f"  (DM {_aw.spread_at_cover:.1f} bps{_vs_market(_aw.spread_at_cover, _mkt)})"
+               if _aw.spread_at_cover is not None else "")
         )
         _cards.append(mo.callout(mo.md(_award_md), kind="success"))
 
@@ -978,10 +997,21 @@ def _ib_messages(date, datetime, get_state, mo, pd):
     ]
     for _i, _c in enumerate(_lines_cfg, 1):
         _nc = _c.get("nc_date").strftime("%m/%y") if _c.get("nc_date") else "n/a"
+        _re = _c.get("reinvest_end").strftime("%m/%y") if _c.get("reinvest_end") else "n/a"
         _res = f"{_c['reserve']:.4f}" if _c.get("reserve") else "NONE"
+        _of = _c.get("orig_face") or _c.get("face") or 0
+        _fct = (_c.get("face") or 0) / max(_of, 1)
+        _qs = f"S+{_c['quoted_spread']:.0f}" if _c.get("quoted_spread") else ""
+        _ms = f"mkt +{_c['market_spread']:.0f}" if _c.get("market_spread") else ""
+        _spread_str = " ".join(p for p in (_qs, _ms) if p)
+        _deal = _c.get("deal_name", "")
+        _rating = _c.get("rating", "")
         _announce_lines.append(
-            f"  {_i}) {_c.get('cusip','')} {_c.get('tranche','')} "
-            f"${_fmt_face(_c.get('face') or 0)} | NC {_nc} | Reserve: {_res}"
+            f"  {_i}) {_deal} {_rating} {_c.get('tranche','')} {_c.get('cusip','')}"
+        )
+        _announce_lines.append(
+            f"     ${_fmt_face(_c.get('face') or 0)} (f={_fct:.3f}) | "
+            f"NC {_nc} | RE {_re} | {_spread_str} | Res: {_res}"
         )
     _announce_lines += [
         "",
@@ -1021,26 +1051,54 @@ def _ib_messages(date, datetime, get_state, mo, pd):
     ])
 
     # ── 5. COLOR (post-award) ──────────────────────────────────────────────
+    _cfg_by_id_msg = {c["line_id"]: c for c in _lines_cfg}
+    _RATING_ORDER = ["AAA", "AA", "A", "BBB", "BB", "B", "Equity", ""]
+
+    def _rating_idx(r):
+        return _RATING_ORDER.index(r) if r in _RATING_ORDER else 99
+
     _color_lines = [f"*** COLOR — {_bwic_id} ***", ""]
     if _bwic and _phase == "awarded":
+        # Group lines by rating
+        _by_rating = {}
         for _line in _bwic.lines:
-            _aw = _line.award
-            if _aw is None:
-                continue
-            _hdr = f"{_line.line_id} {_line.tranche_name} ${_fmt_face(_line.current_face)}"
-            if _aw.is_dnt:
-                _color_lines.append(f"{_hdr}: DNT — {_aw.dnt_reason}")
-                continue
-            _best = _line._best_bid_per_dealer()
-            _color_lines.append(f"{_hdr}:")
-            if _aw.cover_dealer:
-                _color_lines.append(
-                    f"  Cover @ {_aw.cover_price:.4f}"
-                    + (f"  (DM {_aw.spread_at_cover:.1f})" if _aw.spread_at_cover is not None else "")
-                )
-            else:
-                _color_lines.append("  TRADED — no cover (single bid)")
-            _color_lines.append(f"  {len(_best)} bids")
+            _cfg = _cfg_by_id_msg.get(_line.line_id, {})
+            _rating = _cfg.get("rating", "") or "—"
+            _by_rating.setdefault(_rating, []).append((_line, _cfg))
+
+        for _rating in sorted(_by_rating, key=_rating_idx):
+            _color_lines.append(f"--- {_rating} ---")
+            _covers, _wides, _tights = [], [], []
+            for _line, _cfg in _by_rating[_rating]:
+                _aw = _line.award
+                if _aw is None:
+                    continue
+                _deal = _cfg.get("deal_name", "")
+                _hdr = f"{_deal} {_line.tranche_name} ${_fmt_face(_line.current_face)}"
+                if _aw.is_dnt:
+                    _color_lines.append(f"  {_hdr}: DNT — {_aw.dnt_reason}")
+                    continue
+                _best = _line._best_bid_per_dealer()
+                _mkt = _cfg.get("market_spread")
+                _vs = ""
+                if _aw.spread_at_cover is not None and _mkt:
+                    _d = _mkt - _aw.spread_at_cover
+                    if abs(_d) >= 0.05:
+                        _vs = f" ({'+' if _d > 0 else '−'}{abs(_d):.1f} v mkt)"
+                _color_lines.append(f"  {_hdr}:")
+                if _aw.cover_dealer:
+                    _color_lines.append(
+                        f"    Cover @ {_aw.cover_price:.4f}"
+                        + (f"  (DM {_aw.spread_at_cover:.1f}{_vs})" if _aw.spread_at_cover is not None else "")
+                    )
+                    _covers.append(_aw.spread_at_cover)
+                else:
+                    _color_lines.append("    TRADED — no cover (single bid)")
+                _color_lines.append(f"    {len(_best)} bids")
+            # rating-tier summary
+            if _covers:
+                _avg = sum(_covers) / len(_covers)
+                _color_lines.append(f"  → {_rating} avg cover DM {_avg:.1f} bps")
             _color_lines.append("")
         _color_lines.append("Thanks for participating.")
     else:
