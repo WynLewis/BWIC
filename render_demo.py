@@ -308,9 +308,8 @@ prices = sorted([b.price for b in best.values()], reverse=True)
 color_ib = f"""*** COLOR — BWIC-2026-04-28-001 ***
 
 L1 AAA $100MM:
-  TRADED @ {award.award_price:.4f}  (DM {award.spread_at_award:.1f})
-  Cover  @ {award.cover_price:.4f}  (DM {award.spread_at_cover:.1f})
-  Range  {prices[-1]:.4f} – {prices[0]:.4f} | {len(best)} bids
+  Cover @ {award.cover_price:.4f}  (DM {award.spread_at_cover:.1f})
+  {len(best)} bids
 
 Thanks for participating."""
 

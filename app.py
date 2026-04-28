@@ -965,20 +965,15 @@ def _ib_messages(date, datetime, get_state, mo, pd):
                 _color_lines.append(f"{_hdr}: DNT — {_aw.dnt_reason}")
                 continue
             _best = _line._best_bid_per_dealer()
-            _prices = sorted([b.price for b in _best.values()], reverse=True)
             _color_lines.append(f"{_hdr}:")
-            _color_lines.append(
-                f"  TRADED @ {_aw.award_price:.4f}"
-                + (f"  (DM {_aw.spread_at_award:.1f})" if _aw.spread_at_award is not None else "")
-            )
             if _aw.cover_dealer:
                 _color_lines.append(
-                    f"  Cover  @ {_aw.cover_price:.4f}"
+                    f"  Cover @ {_aw.cover_price:.4f}"
                     + (f"  (DM {_aw.spread_at_cover:.1f})" if _aw.spread_at_cover is not None else "")
                 )
-            _color_lines.append(
-                f"  Range  {_prices[-1]:.4f} – {_prices[0]:.4f} | {len(_best)} bids"
-            )
+            else:
+                _color_lines.append("  TRADED — no cover (single bid)")
+            _color_lines.append(f"  {len(_best)} bids")
             _color_lines.append("")
         _color_lines.append("Thanks for participating.")
     else:
