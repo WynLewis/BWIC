@@ -240,20 +240,38 @@ def _meta_inputs(mo):
 
 @app.cell
 def _line_inputs(date, mo):
-    cusip_inp     = mo.ui.text(value="",          label="CUSIP")
-    tranche_inp   = mo.ui.text(value="",          label="Tranche")
-    face_inp      = mo.ui.number(value=100_000_000, step=1_000_000, label="Current Face ($)")
-    nc_date_inp   = mo.ui.date(value=date(2027, 4, 25), label="NC Date")
-    reserve_inp   = mo.ui.number(value=None, start=0, stop=120, step=0.0625, label="Reserve Price (optional)")
-    market_upload = mo.ui.file(filetypes=[".xlsx", ".xls"], label="Market scenario (20 CPR / 2 CDR / 30 SEV)")
-    base_upload   = mo.ui.file(filetypes=[".xlsx", ".xls"], label="Base scenario (15 CPR / 5 CDR / 50 SEV)")
+    deal_name_inp     = mo.ui.text(value="", label="Deal name", placeholder="ABC 2024-1A")
+    cusip_inp         = mo.ui.text(value="", label="CUSIP")
+    rating_inp        = mo.ui.dropdown(
+        options=["AAA", "AA", "A", "BBB", "BB", "B", "Equity"],
+        value="AAA",
+        label="Rating",
+    )
+    tranche_inp       = mo.ui.text(value="", label="Tranche label", placeholder="A-1, B, C, ...")
+    face_inp          = mo.ui.number(value=100_000_000, step=1_000_000, label="Current Face ($)")
+    orig_face_inp     = mo.ui.number(value=100_000_000, step=1_000_000, label="Original Face ($)")
+    quoted_spread_inp = mo.ui.number(value=115, step=1, start=0, stop=2000, label="Quoted spread (bps)")
+    market_spread_inp = mo.ui.number(value=122, step=1, start=0, stop=2000, label="Market spread (bps)")
+    settle_inp        = mo.ui.date(value=date(2026, 4, 28), label="Settle date")
+    nc_date_inp       = mo.ui.date(value=date(2027, 4, 25), label="NC end")
+    reinvest_end_inp  = mo.ui.date(value=date(2030, 4, 25), label="Reinvest end")
+    reserve_inp       = mo.ui.number(value=None, start=0, stop=120, step=0.0625, label="Reserve price (optional)")
+    market_upload     = mo.ui.file(filetypes=[".xlsx", ".xls"], label="Market scenario (20 CPR / 2 CDR / 30 SEV)")
+    base_upload       = mo.ui.file(filetypes=[".xlsx", ".xls"], label="Base scenario (15 CPR / 5 CDR / 50 SEV)")
     return (
         base_upload,
         cusip_inp,
+        deal_name_inp,
         face_inp,
+        market_spread_inp,
         market_upload,
         nc_date_inp,
+        orig_face_inp,
+        quoted_spread_inp,
+        rating_inp,
+        reinvest_end_inp,
         reserve_inp,
+        settle_inp,
         tranche_inp,
     )
 
@@ -270,16 +288,23 @@ def _setup_actions(
     cusip_inp,
     date,
     datetime,
+    deal_name_inp,
     face_inp,
     get_state,
     load_stream_from_bytes,
+    market_spread_inp,
     market_upload,
     mo,
     nc_date_inp,
+    orig_face_inp,
+    quoted_spread_inp,
     r1_dur_inp,
+    rating_inp,
+    reinvest_end_inp,
     reserve_inp,
     seller_input,
     set_state,
+    settle_inp,
     timedelta,
     tranche_inp,
 ):
@@ -296,6 +321,7 @@ def _setup_actions(
             if market_upload.value:
                 market_stream = load_stream_from_bytes(
                     market_upload.value[0].contents,
+                    settle_date=settle_inp.value,
                     balance_override=float(face_inp.value or 0) or None,
                 )
         except Exception as exc:
@@ -304,6 +330,7 @@ def _setup_actions(
             if base_upload.value:
                 base_stream = load_stream_from_bytes(
                     base_upload.value[0].contents,
+                    settle_date=settle_inp.value,
                     balance_override=float(face_inp.value or 0) or None,
                 )
         except Exception as exc:
@@ -311,10 +338,17 @@ def _setup_actions(
 
         new_line = {
             "line_id": line_id,
+            "deal_name": deal_name_inp.value or f"Demo Deal {idx}",
             "cusip": cusip_inp.value or f"DEMO{idx:04d}",
-            "tranche": tranche_inp.value or f"Tranche {idx}",
+            "rating": rating_inp.value or "AAA",
+            "tranche": tranche_inp.value or rating_inp.value or "A-1",
             "face": float(face_inp.value or 0),
+            "orig_face": float(orig_face_inp.value or face_inp.value or 0),
+            "quoted_spread": float(quoted_spread_inp.value or 0),
+            "market_spread": float(market_spread_inp.value or 0),
+            "settle_date": settle_inp.value,
             "nc_date": nc_date_inp.value,
+            "reinvest_end": reinvest_end_inp.value,
             "reserve": float(reserve_inp.value) if reserve_inp.value else None,
             "market_stream": market_stream,
             "base_stream": base_stream,
@@ -330,20 +364,37 @@ def _setup_actions(
         )
 
     def _load_demo(_):
+        """Load a four-tranche demo BWIC: AAA / AA / A / BBB."""
         s = get_state()
-        market = build_demo_stream(spread_bps=115)
-        base = build_demo_stream(spread_bps=115)
-        demo_line = {
-            "line_id": f"L{len(s['lines_config']) + 1}",
-            "cusip": "12345ABC0",
-            "tranche": "AAA",
-            "face": 100_000_000.0,
-            "nc_date": date(2027, 4, 25),
-            "reserve": None,
-            "market_stream": market,
-            "base_stream": base,
-        }
-        set_state({**s, "lines_config": s["lines_config"] + [demo_line]})
+        # (rating, tranche_label, face_mm, quoted_bps, market_bps, nc_yrs)
+        _tranches = [
+            ("AAA", "A-1",  100, 115, 122, 1.0),
+            ("AA",  "B",     50, 175, 185, 1.5),
+            ("A",   "C",     25, 250, 270, 2.0),
+            ("BBB", "D",     20, 380, 410, 2.5),
+        ]
+        new_lines = list(s["lines_config"])
+        for i, (rating, label, face_mm, qs, ms, nc_yr) in enumerate(_tranches, 1):
+            mkt = build_demo_stream(spread_bps=qs)
+            base = build_demo_stream(spread_bps=qs)
+            new_lines.append({
+                "line_id":       f"L{len(new_lines) + 1}",
+                "deal_name":     "ABC 2024-1A",
+                "cusip":         f"00000{i:03d}A",
+                "rating":        rating,
+                "tranche":       label,
+                "face":          face_mm * 1_000_000.0,
+                "orig_face":     face_mm * 1_000_000.0,
+                "quoted_spread": float(qs),
+                "market_spread": float(ms),
+                "settle_date":   date(2026, 4, 28),
+                "nc_date":       date(2026 + int(nc_yr), 4, 25),
+                "reinvest_end":  date(2030, 4, 25),
+                "reserve":       None,
+                "market_stream": mkt,
+                "base_stream":   base,
+            })
+        set_state({**s, "lines_config": new_lines})
 
     def _clear_lines(_):
         s = get_state()
@@ -400,15 +451,18 @@ def _pricing_table(get_state, mo, pd, price_line_at):
     for _cfg in _s["lines_config"]:
         _result = price_line_at(_cfg, 100.0)  # at par
         _row = {
-            "Line": _cfg["line_id"],
-            "CUSIP": _cfg.get("cusip", ""),
-            "Tranche": _cfg.get("tranche", ""),
-            "Face ($mm)": (_cfg.get("face") or 0) / 1_000_000,
-            "NC Date": _cfg.get("nc_date"),
-            "Reserve": _cfg.get("reserve"),
-            "Streams": ", ".join(
-                k for k in ("Market", "Base") if _cfg.get(f"{k.lower()}_stream") is not None
-            ) or "—",
+            "Line":      _cfg["line_id"],
+            "Deal":      _cfg.get("deal_name", ""),
+            "CUSIP":     _cfg.get("cusip", ""),
+            "Rating":    _cfg.get("rating", ""),
+            "Tranche":   _cfg.get("tranche", ""),
+            "Face $mm":  (_cfg.get("face") or 0) / 1_000_000,
+            "Factor":    round((_cfg.get("face") or 0) / max(_cfg.get("orig_face") or 1, 1), 4),
+            "S+":        _cfg.get("quoted_spread"),
+            "Mkt+":      _cfg.get("market_spread"),
+            "NC":        _cfg.get("nc_date"),
+            "RE end":    _cfg.get("reinvest_end"),
+            "Reserve":   _cfg.get("reserve"),
         }
         if _result is not None:
             for _label in ("Market", "Base"):
@@ -446,18 +500,25 @@ def _setup_section(
     bwic_id_input,
     clear_btn,
     cusip_inp,
+    deal_name_inp,
     demo_btn,
     face_inp,
     get_state,
+    market_spread_inp,
     market_upload,
     mo,
     nc_date_inp,
     open_r1_btn,
+    orig_face_inp,
     pricing_table_md,
+    quoted_spread_inp,
     r1_dur_inp,
     r2_dur_inp,
+    rating_inp,
+    reinvest_end_inp,
     reserve_inp,
     seller_input,
+    settle_inp,
     tranche_inp,
 ):
     _s = get_state()
@@ -468,7 +529,13 @@ def _setup_section(
             mo.md("## 1 · BWIC details"),
             mo.hstack([bwic_id_input, seller_input], gap=2, justify="start"),
             mo.md("## 2 · Add lines"),
-            mo.hstack([cusip_inp, tranche_inp, face_inp, nc_date_inp, reserve_inp], gap=1, justify="start"),
+            mo.md("**Identity**"),
+            mo.hstack([deal_name_inp, cusip_inp, rating_inp, tranche_inp], gap=1, justify="start"),
+            mo.md("**Sizing & spreads**"),
+            mo.hstack([face_inp, orig_face_inp, quoted_spread_inp, market_spread_inp], gap=1, justify="start"),
+            mo.md("**Dates & reserve**"),
+            mo.hstack([settle_inp, nc_date_inp, reinvest_end_inp, reserve_inp], gap=1, justify="start"),
+            mo.md("**Cashflows (Intex Excel)**"),
             mo.hstack([market_upload, base_upload], gap=2, justify="start"),
             mo.hstack([add_line_btn, demo_btn, clear_btn], gap=1, justify="start"),
             mo.md("## 3 · Pricing reference"),
