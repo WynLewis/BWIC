@@ -456,5 +456,258 @@ def _notifications(get_state, mo):
     return
 
 
+# ============================================================================
+# Stage 2 — Stable bid-form inputs (persist across state changes)
+# ============================================================================
+
+@app.cell
+def _bid_stable_inputs(mo):
+    dealer_inp = mo.ui.text(value="", label="Dealer", placeholder="GS, JPM, MS…")
+    price_inp  = mo.ui.number(
+        value=100.0, step=0.0625, start=50.0, stop=150.0,
+        label="Bid Price (% par)",
+    )
+    return dealer_inp, price_inp
+
+
+# ============================================================================
+# Round 1 — bid entry, live DM preview, blotter, close button
+# ============================================================================
+
+@app.cell
+def _r1_section(
+    BidError, dealer_inp, fmt, get_state, mo, pd, price_inp, price_line_at, set_state,
+):
+    _s = get_state()
+    mo.stop(_s["phase"] != "r1_open")
+
+    _bwic   = _s["bwic"]
+    _lines  = _s["lines_config"]
+    _opts   = {c["line_id"]: f"{c['line_id']} · {c.get('tranche','')} {c.get('cusip','')}"
+               for c in _lines}
+
+    r1_line_sel = mo.ui.dropdown(options=_opts, label="Line")
+
+    # ── Live DM preview ────────────────────────────────────────────────────
+    _sel   = r1_line_sel.value
+    _price = price_inp.value
+    _dm_txt = "Select a line to see live DM"
+    if _sel:
+        _cfg = next((c for c in _lines if c["line_id"] == _sel), None)
+        if _cfg:
+            try:
+                _pr = price_line_at(_cfg, _price)
+                if _pr:
+                    _parts = []
+                    for _lbl in ("Market", "Base"):
+                        _r = _pr.results.get(_lbl)
+                        if _r and _r.dm_to_worst is not None:
+                            _parts.append(
+                                f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
+                                f"DM-M: {fmt(_r.dm_to_maturity)} | "
+                                f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
+                            )
+                    _dm_txt = " · ".join(_parts) if _parts else "No streams loaded for this line"
+            except Exception as _exc:
+                _dm_txt = f"Pricing error: {_exc}"
+
+    # ── Callbacks ──────────────────────────────────────────────────────────
+    def _submit(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None or not r1_line_sel.value or not dealer_inp.value.strip():
+            return
+        try:
+            _b.submit_bid(r1_line_sel.value, dealer_inp.value.strip(), price_inp.value)
+            set_state({**_st, "bwic": _b, "notifications": []})
+        except BidError as _e:
+            set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
+
+    def _close_r1(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None:
+            return
+        _b.close_round1(top_n=3)
+        set_state({**_st, "bwic": _b, "phase": "r1_closed"})
+
+    _submit_btn   = mo.ui.button(label="Submit Bid ▶",  kind="success", on_click=_submit)
+    _close_r1_btn = mo.ui.button(label="Close Round 1", kind="warn",    on_click=_close_r1)
+
+    # ── Blotter (live) ─────────────────────────────────────────────────────
+    _bid_rows = []
+    if _bwic:
+        for _line in _bwic.lines:
+            for _bid in _line.round1_bids():
+                _bid_rows.append({
+                    "Line":   _bid.line_id,
+                    "Dealer": _bid.dealer,
+                    "Price":  round(_bid.price, 4),
+                    "Time":   _bid.timestamp.strftime("%H:%M:%S"),
+                })
+    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
+
+    mo.vstack([
+        mo.md("## Round 1 — Bid Intake"),
+        mo.hstack([r1_line_sel, dealer_inp, price_inp, _submit_btn], gap=1, justify="start"),
+        mo.callout(mo.md(_dm_txt), kind="neutral"),
+        mo.md("### Live bids"),
+        mo.ui.table(_blotter_df, selection=None, page_size=30),
+        mo.md("---"),
+        mo.hstack([_close_r1_btn], justify="end"),
+    ])
+    return
+
+
+# ============================================================================
+# Round 1 results — advancing dealers + Open R2
+# ============================================================================
+
+@app.cell
+def _r1_results(get_state, mo, pd, set_state):
+    _s = get_state()
+    mo.stop(_s["phase"] != "r1_closed")
+
+    _bwic = _s["bwic"]
+
+    def _open_r2(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None:
+            return
+        try:
+            _b.open_round2()
+            set_state({**_st, "bwic": _b, "phase": "r2_open"})
+        except Exception as _exc:
+            set_state({**_st, "notifications": _st["notifications"] + [str(_exc)]})
+
+    _open_r2_btn = mo.ui.button(label="Open Round 2 →", kind="success", on_click=_open_r2)
+
+    _adv_rows = []
+    if _bwic:
+        for _line in _bwic.lines:
+            _best = _line._best_bid_per_dealer(round_filter=1)
+            _ranked = sorted(_best.values(), key=lambda b: (-b.price, b.timestamp))
+            for _i, _bid in enumerate(_ranked):
+                _adv_rows.append({
+                    "Line":     _line.line_id,
+                    "Tranche":  _line.tranche_name,
+                    "Rank":     _i + 1,
+                    "Dealer":   _bid.dealer,
+                    "R1 Price": round(_bid.price, 4),
+                    "Advance?": "✓" if _bid.dealer in _line.advancing_dealers else "",
+                })
+
+    _adv_df = pd.DataFrame(_adv_rows) if _adv_rows else pd.DataFrame()
+
+    mo.vstack([
+        mo.md("## Round 1 — Results"),
+        mo.ui.table(_adv_df, selection=None, page_size=30),
+        mo.md("---"),
+        mo.hstack([_open_r2_btn], justify="end"),
+    ])
+    return
+
+
+# ============================================================================
+# Round 2 — bid entry, live DM preview, blotter, close button
+# ============================================================================
+
+@app.cell
+def _r2_section(
+    BidError, dealer_inp, fmt, get_state, mo, pd, price_inp, price_line_at, set_state,
+):
+    _s = get_state()
+    mo.stop(_s["phase"] != "r2_open")
+
+    _bwic  = _s["bwic"]
+    _lines = _s["lines_config"]
+
+    # Only advancing dealers matter — show per-line advancing sets
+    _adv_map: dict[str, list[str]] = {}
+    if _bwic:
+        for _line in _bwic.lines:
+            _adv_map[_line.line_id] = _line.advancing_dealers
+
+    _opts = {c["line_id"]: f"{c['line_id']} · {c.get('tranche','')} (adv: {', '.join(_adv_map.get(c['line_id'], []))})"
+             for c in _lines}
+
+    r2_line_sel = mo.ui.dropdown(options=_opts, label="Line")
+
+    # ── Live DM preview ────────────────────────────────────────────────────
+    _sel   = r2_line_sel.value
+    _price = price_inp.value
+    _dm_txt = "Select a line to see live DM"
+    if _sel:
+        _cfg = next((c for c in _lines if c["line_id"] == _sel), None)
+        if _cfg:
+            try:
+                _pr = price_line_at(_cfg, _price)
+                if _pr:
+                    _parts = []
+                    for _lbl in ("Market", "Base"):
+                        _r = _pr.results.get(_lbl)
+                        if _r and _r.dm_to_worst is not None:
+                            _parts.append(
+                                f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
+                                f"DM-M: {fmt(_r.dm_to_maturity)} | "
+                                f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
+                            )
+                    _dm_txt = " · ".join(_parts) if _parts else "No streams for this line"
+            except Exception as _exc:
+                _dm_txt = f"Pricing error: {_exc}"
+
+    # ── Callbacks ──────────────────────────────────────────────────────────
+    def _submit_r2(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None or not r2_line_sel.value or not dealer_inp.value.strip():
+            return
+        try:
+            _b.submit_bid(r2_line_sel.value, dealer_inp.value.strip(), price_inp.value)
+            set_state({**_st, "bwic": _b, "notifications": []})
+        except BidError as _e:
+            set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
+
+    def _close_r2(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None:
+            return
+        _b.close_round2()
+        set_state({**_st, "bwic": _b, "phase": "awarded"})
+
+    _submit_btn   = mo.ui.button(label="Submit Bid ▶",  kind="success", on_click=_submit_r2)
+    _close_r2_btn = mo.ui.button(label="Close Round 2", kind="warn",    on_click=_close_r2)
+
+    # ── R2 blotter ─────────────────────────────────────────────────────────
+    _bid_rows = []
+    if _bwic:
+        for _line in _bwic.lines:
+            for _bid in _line.round2_bids():
+                _bid_rows.append({
+                    "Line":   _bid.line_id,
+                    "Dealer": _bid.dealer,
+                    "Price":  round(_bid.price, 4),
+                    "Time":   _bid.timestamp.strftime("%H:%M:%S"),
+                })
+    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
+
+    # ── Advancing dealers reminder ─────────────────────────────────────────
+    _adv_lines = [f"**{lid}**: {', '.join(adv)}" for lid, adv in _adv_map.items() if adv]
+
+    mo.vstack([
+        mo.md("## Round 2 — Bid Intake"),
+        mo.callout(mo.md("Advancing dealers: " + " · ".join(_adv_lines)), kind="neutral"),
+        mo.hstack([r2_line_sel, dealer_inp, price_inp, _submit_btn], gap=1, justify="start"),
+        mo.callout(mo.md(_dm_txt), kind="neutral"),
+        mo.md("### R2 bids submitted"),
+        mo.ui.table(_blotter_df, selection=None, page_size=30),
+        mo.md("---"),
+        mo.hstack([_close_r2_btn], justify="end"),
+    ])
+    return
+
+
 if __name__ == "__main__":
     app.run()
