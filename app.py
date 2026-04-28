@@ -304,6 +304,22 @@ def _ticker(mo):
     return (tick,)
 
 
+@app.cell
+def _clear_state(mo):
+    # Incremented on successful bid submit when "Reset form" checkbox is on.
+    # _bid_stable_inputs depends on this so it recreates the inputs (resetting values).
+    get_clear, set_clear = mo.state(0)
+    return get_clear, set_clear
+
+
+@app.cell
+def _alert_state(mo):
+    # Tracks which timer thresholds have already fired an alert this round
+    # to avoid re-alerting on every tick.  Stored as set of (round, threshold_secs).
+    get_alerts, set_alerts = mo.state(set())
+    return get_alerts, set_alerts
+
+
 # ============================================================================
 # Stable form inputs (don't depend on mutable state — values persist)
 # ============================================================================
@@ -522,7 +538,7 @@ def _setup_actions(
 # ============================================================================
 
 @app.cell
-def _pricing_table(get_state, mo, pd, price_line_at):
+def _pricing_table(BondAnalytics, get_state, mo, pd, price_line_at):
     _s = get_state()
     _rows = []
     for _cfg in _s["lines_config"]:
@@ -546,10 +562,19 @@ def _pricing_table(get_state, mo, pd, price_line_at):
                 _r = _result.results.get(_label)
                 if _r is None:
                     continue
+                _dm_w = _r.dm_to_worst
                 _row[f"{_label} DM-Mat"] = round(_r.dm_to_maturity, 1) if _r.dm_to_maturity is not None else None
                 _row[f"{_label} DM-Call"] = round(_r.dm_to_call, 1) if _r.dm_to_call is not None else None
-                _row[f"{_label} DM-Worst"] = round(_r.dm_to_worst, 1) if _r.dm_to_worst is not None else None
+                _row[f"{_label} DM-Worst"] = round(_dm_w, 1) if _dm_w is not None else None
                 _row[f"{_label} WAL"] = round(_r.wal_to_maturity, 2) if _r.wal_to_maturity is not None else None
+                # Modified duration at par using DM-to-Worst
+                _stream = _cfg.get(f"{_label.lower()}_stream")
+                if _stream is not None and _dm_w is not None and _dm_w > -9999:
+                    try:
+                        _mdur = BondAnalytics(_stream).modified_duration(100.0, _dm_w)
+                        _row[f"{_label} MDur"] = round(_mdur, 2)
+                    except Exception:
+                        _row[f"{_label} MDur"] = None
         _rows.append(_row)
 
     _pricing_df = pd.DataFrame(_rows) if _rows else pd.DataFrame()
@@ -655,15 +680,22 @@ def _notifications(get_state, mo):
 # ============================================================================
 
 @app.cell
-def _bid_stable_inputs(mo):
-    # Common CLO BWIC counterparties — extend in code as your roster grows.
-    DEALER_ROSTER = [
-        "GS", "JPM", "MS", "BofA", "Citi", "Barclays", "DB", "Wells",
-        "BMO", "CS", "Nomura", "Jefferies", "Mizuho", "RBC", "BNP",
-        "SocGen", "HSBC", "Natixis", "MUFG", "Other...",
-    ]
+def _bid_stable_inputs(mo, get_clear):
+    _ = get_clear()  # depend on clear counter — inputs recreate at par when triggered
+    # Dealer roster loaded from dealers.json; falls back to built-in defaults
+    import json as _json, os as _os
+    _roster_path = _os.path.join(_os.path.dirname(__file__), "dealers.json")
+    try:
+        with open(_roster_path) as _f:
+            DEALER_ROSTER = _json.load(_f)
+    except Exception:
+        DEALER_ROSTER = [
+            "GS", "JPM", "MS", "BofA", "Citi", "Barclays", "DB", "Wells",
+            "BMO", "CS", "Nomura", "Jefferies", "Mizuho", "RBC", "BNP",
+            "SocGen", "HSBC", "Natixis", "MUFG", "Other...",
+        ]
     dealer_dd = mo.ui.dropdown(
-        options=DEALER_ROSTER, value="GS",
+        options=DEALER_ROSTER, value=DEALER_ROSTER[0] if DEALER_ROSTER else "GS",
         label="Dealer",
     )
     dealer_other_inp = mo.ui.text(value="", label="Other dealer (when 'Other...' picked)")
@@ -671,7 +703,8 @@ def _bid_stable_inputs(mo):
         value=100.0, step=0.0625, start=50.0, stop=150.0,
         label="Bid Price (% par)",
     )
-    return DEALER_ROSTER, dealer_dd, dealer_other_inp, price_inp
+    auto_clear_chk = mo.ui.checkbox(value=False, label="Reset form after submit")
+    return DEALER_ROSTER, auto_clear_chk, dealer_dd, dealer_other_inp, price_inp
 
 
 # ============================================================================
@@ -680,9 +713,10 @@ def _bid_stable_inputs(mo):
 
 @app.cell
 def _r1_section(
-    BidError, BondAnalytics, bid_sanity, countdown, datetime, dealer_dd,
-    dealer_other_inp, fmt, get_state, mo, pd, price_inp, price_line_at,
-    resolve_dealer, set_state, tick, timedelta,
+    BidError, BondAnalytics, auto_clear_chk, bid_sanity, countdown,
+    datetime, dealer_dd, dealer_other_inp, fmt, get_clear, get_state,
+    mo, pd, price_inp, price_line_at, resolve_dealer, set_clear,
+    set_state, tick, timedelta,
 ):
     _ = tick.value  # subscribe to 1Hz tick so the countdown re-renders
     _s = get_state()
@@ -706,36 +740,57 @@ def _r1_section(
     # ── Live DM preview ────────────────────────────────────────────────────
     _sel   = r1_line_sel.value
     _price = price_inp.value
+    _cfg   = next((c for c in _lines if c["line_id"] == _sel), None) if _sel else None
     _dm_txt = "Select a line to see live DM"
-    if _sel:
-        _cfg = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg:
-            try:
-                _pr = price_line_at(_cfg, _price)
-                if _pr:
-                    _parts = []
-                    for _lbl in ("Market", "Base"):
-                        _r = _pr.results.get(_lbl)
-                        if _r and _r.dm_to_worst is not None:
-                            _parts.append(
-                                f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
-                                f"DM-M: {fmt(_r.dm_to_maturity)} | "
-                                f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
-                            )
-                    _dm_txt = " · ".join(_parts) if _parts else "No streams loaded for this line"
-            except Exception as _exc:
-                _dm_txt = f"Pricing error: {_exc}"
+    if _cfg:
+        try:
+            _pr = price_line_at(_cfg, _price)
+            if _pr:
+                _parts = []
+                for _lbl in ("Market", "Base"):
+                    _r = _pr.results.get(_lbl)
+                    if _r and _r.dm_to_worst is not None:
+                        _parts.append(
+                            f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
+                            f"DM-M: {fmt(_r.dm_to_maturity)} | "
+                            f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
+                        )
+                _dm_txt = " · ".join(_parts) if _parts else "No streams loaded for this line"
+        except Exception as _exc:
+            _dm_txt = f"Pricing error: {_exc}"
+
+    # ── DM sensitivity bracket (±1 / ±5 bps around current price) ─────────
+    _dm_sens_md = mo.md("")
+    if _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_sens = BondAnalytics(_cfg["market_stream"])
+            _dm_cur = _ba_sens.dm_from_price(_price)
+            if _dm_cur > -9999:
+                _sens_rows = []
+                for _d in (-5, -1, 0, 1, 5):
+                    _dm_t = _dm_cur + _d
+                    _px   = _ba_sens.price_from_dm(_dm_t) if _d != 0 else _price
+                    _sens_rows.append({
+                        "Δ DM": f"{_d:+d}" if _d != 0 else "→ bid",
+                        "DM (bps)": f"{_dm_t:.1f}",
+                        "Price": f"{_px:.4f}",
+                        "Δ Price": f"{(_px - _price):+.4f}" if _d != 0 else "—",
+                    })
+                _dm_sens_md = mo.vstack([
+                    mo.md("**DM sensitivity (Market, at bid price)**"),
+                    mo.ui.table(pd.DataFrame(_sens_rows), selection=None),
+                ])
+        except Exception:
+            pass
 
     # ── Bid sanity warnings (live as user types price/line) ───────────────
     _warn_lines = []
-    if _sel and _bwic:
-        _cfg_w = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg_w and _cfg_w.get("market_stream") is not None:
-            try:
-                _ba_w = BondAnalytics(_cfg_w["market_stream"])
-                _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg_w.get("market_spread"), _ba_w)
-            except Exception:
-                pass
+    if _sel and _bwic and _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_w = BondAnalytics(_cfg["market_stream"])
+            _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg.get("market_spread"), _ba_w)
+        except Exception:
+            pass
 
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _submit(_):
@@ -747,6 +802,8 @@ def _r1_section(
         try:
             _b.submit_bid(r1_line_sel.value, _dealer, price_inp.value)
             set_state({**_st, "bwic": _b, "notifications": []})
+            if auto_clear_chk.value:
+                set_clear(get_clear() + 1)
         except BidError as _e:
             set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
 
@@ -761,18 +818,53 @@ def _r1_section(
     _submit_btn   = mo.ui.button(label="Submit Bid ▶",  kind="success", on_click=_submit)
     _close_r1_btn = mo.ui.button(label="Close Round 1", kind="warn",    on_click=_close_r1)
 
-    # ── Blotter (live) ─────────────────────────────────────────────────────
+    # ── Blotter (live) — with bid index for deletion ───────────────────────
     _bid_rows = []
+    _global_bid_idx = 0
     if _bwic:
         for _line in _bwic.lines:
-            for _bid in _line.round1_bids():
+            for _li, _bid in enumerate(_line.bids):
+                if _bid.round != 1:
+                    _global_bid_idx += 1
+                    continue
                 _bid_rows.append({
+                    "#":      _global_bid_idx,
                     "Line":   _bid.line_id,
                     "Dealer": _bid.dealer,
                     "Price":  round(_bid.price, 4),
                     "Time":   _bid.timestamp.strftime("%H:%M:%S"),
                 })
-    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
+                _global_bid_idx += 1
+    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(
+        columns=["#", "Line", "Dealer", "Price", "Time"])
+
+    _blotter_tbl = mo.ui.table(_blotter_df, selection="single", page_size=30)
+
+    def _delete_bid(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None or not _blotter_tbl.value or len(_blotter_tbl.value) == 0:
+            return
+        _row = _blotter_tbl.value.iloc[0]
+        _lid = _row["Line"]
+        try:
+            _tgt_line = _b.get_line(_lid)
+            _tgt_idx  = int(_row["#"])
+            # Recompute per-line index from global index
+            _line_bids = [
+                (gi, b) for gi, b in enumerate(
+                    sum([list(l.bids) for l in _b.lines], [])
+                )
+                if b.line_id == _lid
+            ]
+            _local_idx = next((i for i, (gi, _) in enumerate(_line_bids) if gi == _tgt_idx), None)
+            if _local_idx is not None:
+                _b.delete_bid_by_idx(_lid, _local_idx)
+                set_state({**_st, "bwic": _b, "notifications": []})
+        except Exception as _ex:
+            set_state({**_st, "notifications": _st["notifications"] + [f"Delete failed: {_ex}"]})
+
+    _delete_btn = mo.ui.button(label="Delete selected bid", kind="danger", on_click=_delete_bid)
 
     _warn_panel = (
         mo.callout(
@@ -788,12 +880,14 @@ def _r1_section(
             mo.callout(mo.md(_cd_text), kind=_cd_kind),
             _extend_r1_btn, tick,
         ], gap=1, justify="start"),
-        mo.hstack([r1_line_sel, dealer_dd, dealer_other_inp, price_inp, _submit_btn],
-                  gap=1, justify="start"),
+        mo.hstack([r1_line_sel, dealer_dd, dealer_other_inp, price_inp,
+                   auto_clear_chk, _submit_btn], gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
+        _dm_sens_md,
         _warn_panel,
         mo.md("### Live bids"),
-        mo.ui.table(_blotter_df, selection=None, page_size=30),
+        _blotter_tbl,
+        mo.hstack([_delete_btn], justify="start"),
         mo.md("---"),
         mo.hstack([_close_r1_btn], justify="end"),
     ])
@@ -857,9 +951,10 @@ def _r1_results(datetime, get_state, mo, pd, r2_dur_inp, set_state, timedelta):
 
 @app.cell
 def _r2_section(
-    BidError, BondAnalytics, bid_sanity, countdown, datetime, dealer_dd,
-    dealer_other_inp, fmt, get_state, mo, pd, price_inp, price_line_at,
-    resolve_dealer, set_state, tick, timedelta,
+    BidError, BondAnalytics, auto_clear_chk, bid_sanity, countdown,
+    datetime, dealer_dd, dealer_other_inp, fmt, get_clear, get_state,
+    mo, pd, price_inp, price_line_at, resolve_dealer, set_clear,
+    set_state, tick, timedelta,
 ):
     _ = tick.value
     _s = get_state()
@@ -876,7 +971,6 @@ def _r2_section(
     _bwic  = _s["bwic"]
     _lines = _s["lines_config"]
 
-    # Only advancing dealers matter — show per-line advancing sets
     _adv_map: dict[str, list[str]] = {}
     if _bwic:
         for _line in _bwic.lines:
@@ -890,36 +984,57 @@ def _r2_section(
     # ── Live DM preview ────────────────────────────────────────────────────
     _sel   = r2_line_sel.value
     _price = price_inp.value
+    _cfg   = next((c for c in _lines if c["line_id"] == _sel), None) if _sel else None
     _dm_txt = "Select a line to see live DM"
-    if _sel:
-        _cfg = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg:
-            try:
-                _pr = price_line_at(_cfg, _price)
-                if _pr:
-                    _parts = []
-                    for _lbl in ("Market", "Base"):
-                        _r = _pr.results.get(_lbl)
-                        if _r and _r.dm_to_worst is not None:
-                            _parts.append(
-                                f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
-                                f"DM-M: {fmt(_r.dm_to_maturity)} | "
-                                f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
-                            )
-                    _dm_txt = " · ".join(_parts) if _parts else "No streams for this line"
-            except Exception as _exc:
-                _dm_txt = f"Pricing error: {_exc}"
+    if _cfg:
+        try:
+            _pr = price_line_at(_cfg, _price)
+            if _pr:
+                _parts = []
+                for _lbl in ("Market", "Base"):
+                    _r = _pr.results.get(_lbl)
+                    if _r and _r.dm_to_worst is not None:
+                        _parts.append(
+                            f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
+                            f"DM-M: {fmt(_r.dm_to_maturity)} | "
+                            f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
+                        )
+                _dm_txt = " · ".join(_parts) if _parts else "No streams for this line"
+        except Exception as _exc:
+            _dm_txt = f"Pricing error: {_exc}"
+
+    # ── DM sensitivity bracket ─────────────────────────────────────────────
+    _dm_sens_md = mo.md("")
+    if _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_sens = BondAnalytics(_cfg["market_stream"])
+            _dm_cur = _ba_sens.dm_from_price(_price)
+            if _dm_cur > -9999:
+                _sens_rows = []
+                for _d in (-5, -1, 0, 1, 5):
+                    _dm_t = _dm_cur + _d
+                    _px   = _ba_sens.price_from_dm(_dm_t) if _d != 0 else _price
+                    _sens_rows.append({
+                        "Δ DM": f"{_d:+d}" if _d != 0 else "→ bid",
+                        "DM (bps)": f"{_dm_t:.1f}",
+                        "Price": f"{_px:.4f}",
+                        "Δ Price": f"{(_px - _price):+.4f}" if _d != 0 else "—",
+                    })
+                _dm_sens_md = mo.vstack([
+                    mo.md("**DM sensitivity (Market, at bid price)**"),
+                    mo.ui.table(pd.DataFrame(_sens_rows), selection=None),
+                ])
+        except Exception:
+            pass
 
     # ── Bid sanity warnings ───────────────────────────────────────────────
     _warn_lines = []
-    if _sel and _bwic:
-        _cfg_w = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg_w and _cfg_w.get("market_stream") is not None:
-            try:
-                _ba_w = BondAnalytics(_cfg_w["market_stream"])
-                _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg_w.get("market_spread"), _ba_w)
-            except Exception:
-                pass
+    if _sel and _bwic and _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_w = BondAnalytics(_cfg["market_stream"])
+            _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg.get("market_spread"), _ba_w)
+        except Exception:
+            pass
 
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _submit_r2(_):
@@ -931,6 +1046,8 @@ def _r2_section(
         try:
             _b.submit_bid(r2_line_sel.value, _dealer, price_inp.value)
             set_state({**_st, "bwic": _b, "notifications": []})
+            if auto_clear_chk.value:
+                set_clear(get_clear() + 1)
         except BidError as _e:
             set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
 
@@ -945,20 +1062,52 @@ def _r2_section(
     _submit_btn   = mo.ui.button(label="Submit Bid ▶",  kind="success", on_click=_submit_r2)
     _close_r2_btn = mo.ui.button(label="Close Round 2", kind="warn",    on_click=_close_r2)
 
-    # ── R2 blotter ─────────────────────────────────────────────────────────
+    # ── R2 blotter with delete ─────────────────────────────────────────────
     _bid_rows = []
+    _global_bid_idx = 0
     if _bwic:
         for _line in _bwic.lines:
-            for _bid in _line.round2_bids():
+            for _bi, _bid in enumerate(_line.bids):
+                if _bid.round != 2:
+                    _global_bid_idx += 1
+                    continue
                 _bid_rows.append({
+                    "#":      _global_bid_idx,
                     "Line":   _bid.line_id,
                     "Dealer": _bid.dealer,
                     "Price":  round(_bid.price, 4),
                     "Time":   _bid.timestamp.strftime("%H:%M:%S"),
                 })
-    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
+                _global_bid_idx += 1
+    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(
+        columns=["#", "Line", "Dealer", "Price", "Time"])
 
-    # ── Advancing dealers reminder ─────────────────────────────────────────
+    _blotter_tbl = mo.ui.table(_blotter_df, selection="single", page_size=30)
+
+    def _delete_r2_bid(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None or not _blotter_tbl.value or len(_blotter_tbl.value) == 0:
+            return
+        _row = _blotter_tbl.value.iloc[0]
+        _lid = _row["Line"]
+        try:
+            _tgt_idx = int(_row["#"])
+            _line_bids = [
+                (gi, b) for gi, b in enumerate(
+                    sum([list(l.bids) for l in _b.lines], [])
+                )
+                if b.line_id == _lid
+            ]
+            _local_idx = next((i for i, (gi, _) in enumerate(_line_bids) if gi == _tgt_idx), None)
+            if _local_idx is not None:
+                _b.delete_bid_by_idx(_lid, _local_idx)
+                set_state({**_st, "bwic": _b, "notifications": []})
+        except Exception as _ex:
+            set_state({**_st, "notifications": _st["notifications"] + [f"Delete failed: {_ex}"]})
+
+    _delete_btn = mo.ui.button(label="Delete selected bid", kind="danger", on_click=_delete_r2_bid)
+
     _adv_lines = [f"**{lid}**: {', '.join(adv)}" for lid, adv in _adv_map.items() if adv]
 
     _warn_panel = (
@@ -976,12 +1125,14 @@ def _r2_section(
             _extend_r2_btn, tick,
         ], gap=1, justify="start"),
         mo.callout(mo.md("Advancing dealers: " + " · ".join(_adv_lines)), kind="neutral"),
-        mo.hstack([r2_line_sel, dealer_dd, dealer_other_inp, price_inp, _submit_btn],
-                  gap=1, justify="start"),
+        mo.hstack([r2_line_sel, dealer_dd, dealer_other_inp, price_inp,
+                   auto_clear_chk, _submit_btn], gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
+        _dm_sens_md,
         _warn_panel,
         mo.md("### R2 bids submitted"),
-        mo.ui.table(_blotter_df, selection=None, page_size=30),
+        _blotter_tbl,
+        mo.hstack([_delete_btn], justify="start"),
         mo.md("---"),
         mo.hstack([_close_r2_btn], justify="end"),
     ])
