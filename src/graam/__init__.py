@@ -29,7 +29,7 @@ from .bwic_pricing import (
     BASE,
     MARKET,
     STANDARD_SCENARIOS,
-    BwicLine,
+    BwicLine as BwicPricingLine,
     BwicLineMulti,
     BwicMultiResult,
     BwicResult,
@@ -40,6 +40,14 @@ from .bwic_pricing import (
     price_bwic_line_multi,
     price_bwic_multi,
     to_dataframe,
+)
+from .bwic_workflow import (
+    Bid,
+    BidError,
+    Bwic,
+    BwicLine,
+    LineAward,
+    LineState,
 )
 from .intex_loader import (
     load_intex_dataframe,
