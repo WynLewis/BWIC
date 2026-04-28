@@ -58,6 +58,22 @@ class IntexScenario:
 
 
 # ---------------------------------------------------------------------------
+# Standard BWIC scenarios — the two scenarios run for every line
+# ---------------------------------------------------------------------------
+
+MARKET = IntexScenario(cpr=20.0, cdr=2.0, severity=30.0, label="Market")
+"""Market scenario: 20 CPR, 2 CDR, 30% severity. Faster prepays, lighter losses."""
+
+BASE = IntexScenario(cpr=15.0, cdr=5.0, severity=50.0, label="Base")
+"""Base scenario: 15 CPR, 5 CDR, 50% severity. Slower prepays, heavier losses."""
+
+STANDARD_SCENARIOS: dict[str, IntexScenario] = {
+    "Market": MARKET,
+    "Base": BASE,
+}
+
+
+# ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
 
@@ -324,3 +340,133 @@ def dm_price_table(
         price_bwic_line(stream, p, nc_date=nc_date, scenario=scenario)
         for p in prices
     ]
+
+
+# ---------------------------------------------------------------------------
+# Multi-scenario pricing — run each tranche under Market AND Base
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BwicLineMulti:
+    """
+    BWIC line with one cashflow stream per scenario.
+
+    Typical use::
+
+        line = BwicLineMulti(
+            cusip="12345ABC0",
+            tranche_name="AA",
+            bid_price=99.50,
+            nc_date=date(2026, 1, 25),
+            streams={
+                "Market": market_stream,  # from Intex with 20/2/30
+                "Base":   base_stream,    # from Intex with 15/5/50
+            },
+        )
+    """
+    cusip: str = ""
+    tranche_name: str = ""
+    bid_price: float = 0.0
+    nc_date: Optional[date] = None
+    streams: dict[str, CashflowStream] = field(default_factory=dict)
+    scenarios: dict[str, IntexScenario] = field(default_factory=lambda: dict(STANDARD_SCENARIOS))
+
+
+@dataclass
+class BwicMultiResult:
+    """
+    Pricing output for one BWIC line across multiple scenarios.
+
+    Attributes:
+        cusip / tranche_name / bid_price / nc_date: identification.
+        results: one BwicResult per scenario label (e.g. {"Market": ..., "Base": ...}).
+    """
+    cusip: str = ""
+    tranche_name: str = ""
+    bid_price: float = 0.0
+    nc_date: Optional[date] = None
+    results: dict[str, BwicResult] = field(default_factory=dict)
+
+    # ── Convenience accessors ─────────────────────────────────────────────
+
+    def dm_to_worst(self, scenario: str) -> Optional[float]:
+        return self.results.get(scenario, BwicResult()).dm_to_worst
+
+    def dm_to_maturity(self, scenario: str) -> Optional[float]:
+        return self.results.get(scenario, BwicResult()).dm_to_maturity
+
+    def dm_to_call(self, scenario: str) -> Optional[float]:
+        return self.results.get(scenario, BwicResult()).dm_to_call
+
+    def wal_to_worst(self, scenario: str) -> Optional[float]:
+        r = self.results.get(scenario)
+        if r is None:
+            return None
+        return r.wal_to_call if r.worst_case == "call" else r.wal_to_maturity
+
+    def summary_row(self) -> dict:
+        """
+        Flatten to a single dict suitable for a pandas DataFrame row.
+
+        Columns: cusip, tranche, bid, nc_date, then for each scenario
+        DM-Mat / DM-Call / DM-Worst / WAL-Worst.
+        """
+        row: dict = {
+            "cusip": self.cusip,
+            "tranche": self.tranche_name,
+            "bid": self.bid_price,
+            "nc_date": self.nc_date,
+        }
+        for label, r in self.results.items():
+            row[f"{label}_DM_Mat"] = r.dm_to_maturity
+            row[f"{label}_DM_Call"] = r.dm_to_call
+            row[f"{label}_DM_Worst"] = r.dm_to_worst
+            row[f"{label}_WAL_Mat"] = r.wal_to_maturity
+            row[f"{label}_WAL_Call"] = r.wal_to_call
+            row[f"{label}_Worst_Case"] = r.worst_case
+        return row
+
+
+def price_bwic_line_multi(
+    line: BwicLineMulti,
+) -> BwicMultiResult:
+    """
+    Price one BWIC line across all its scenarios.
+
+    Each (scenario_label, stream) pair is priced with the line's bid_price and nc_date.
+    The IntexScenario metadata for each label is taken from line.scenarios (defaults to
+    STANDARD_SCENARIOS = Market + Base).
+    """
+    out = BwicMultiResult(
+        cusip=line.cusip,
+        tranche_name=line.tranche_name,
+        bid_price=line.bid_price,
+        nc_date=line.nc_date,
+    )
+
+    for label, stream in line.streams.items():
+        scenario = line.scenarios.get(label) or IntexScenario(label=label)
+        out.results[label] = price_bwic_line(
+            stream=stream,
+            bid_price=line.bid_price,
+            nc_date=line.nc_date,
+            cusip=line.cusip,
+            tranche_name=line.tranche_name,
+            scenario=scenario,
+        )
+    return out
+
+
+def price_bwic_multi(lines: list[BwicLineMulti]) -> list[BwicMultiResult]:
+    """Run multi-scenario pricing across an entire BWIC list."""
+    return [price_bwic_line_multi(line) for line in lines]
+
+
+def to_dataframe(results: list[BwicMultiResult]):
+    """
+    Flatten a list of BwicMultiResults into a pandas DataFrame for the BWIC blotter.
+
+    One row per line, with columns for each scenario × metric combination.
+    """
+    import pandas as pd
+    return pd.DataFrame([r.summary_row() for r in results])

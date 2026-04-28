@@ -23,8 +23,15 @@ Expected columns (any alias in the list will match):
   sched_principal → "Sched Principal", "Scheduled Principal", "Sched Prin"  (optional)
   prepaid_prin    → "Prepaid Principal", "Unscheduled Principal", "Prepay", "Prepaid Prin" (optional)
   end_balance     → "End Balance", "Ending Balance", "Closing Balance", "Ending Bal"
-  index_rate      → "Index", "Index Rate", "SOFR", "LIBOR", "Base Rate"   (% p.a.)
-  coupon_rate     → "Coupon", "Coupon Rate", "All-In Rate", "Rate"         (% p.a., optional)
+  index_rate      → "Index", "Index Rate", "SOFR", "1m SOFR", "Term SOFR",
+                    "SOFR Forward", "LIBOR", "1mL", "Base Rate"  (% p.a.)
+                    *** REQUIRED for DM calculation — this is the per-period
+                    SOFR/LIBOR forward rate that Intex used to project the
+                    cashflows.  Each row carries that period's forward, and the
+                    DM solver discounts at (forward + spread) per period. ***
+  coupon_rate     → "Coupon", "Coupon Rate", "All-In Rate", "Rate"   (% p.a.)
+                    Used as a fallback if no index_rate column is present
+                    (loader will treat the all-in coupon as the forward proxy).
 
 All balance / cashflow columns are in face-value dollar units.
 All rate columns are in percent per annum (e.g. 5.30 = 5.30% SOFR).
@@ -77,6 +84,14 @@ _ALIASES: dict[str, list[str]] = {
     "index_rate": [
         "index", "index rate", "sofr", "libor", "base rate", "floating index",
         "reference rate", "ref rate", "index value",
+        # Intex SOFR/LIBOR forward variants — the per-period forward rate is what
+        # the DM calc needs.  These are typical Intex Wave / CDI column headers:
+        "sofr forward", "sofr fwd", "fwd sofr", "forward sofr",
+        "libor forward", "libor fwd", "fwd libor", "forward libor",
+        "1m sofr", "1ml", "1m libor", "1mlibor", "1msofr", "1m sofr forward",
+        "3m sofr", "3ml", "3m libor", "3mlibor", "3msofr", "3m sofr forward",
+        "term sofr", "term sofr 1m", "term sofr 3m",
+        "index forward", "index fwd",
     ],
     "coupon_rate": [
         "coupon", "coupon rate", "all-in rate", "all in rate", "rate", "gross coupon",

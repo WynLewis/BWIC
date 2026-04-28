@@ -26,12 +26,20 @@ Quick start::
 from .analytics import BondAnalytics, compute_analytics, npv
 from .amortizer import generate_cashflows
 from .bwic_pricing import (
+    BASE,
+    MARKET,
+    STANDARD_SCENARIOS,
     BwicLine,
+    BwicLineMulti,
+    BwicMultiResult,
     BwicResult,
     IntexScenario,
     dm_price_table,
     price_bwic,
     price_bwic_line,
+    price_bwic_line_multi,
+    price_bwic_multi,
+    to_dataframe,
 )
 from .intex_loader import (
     load_intex_dataframe,
