@@ -709,5 +709,96 @@ def _r2_section(
     return
 
 
+# ============================================================================
+# Stage 3 — Award screen + color sheet + bid log + CSV exports
+# ============================================================================
+
+@app.cell
+def _award_section(get_state, mo, pd, set_state):
+    _s = get_state()
+    mo.stop(_s["phase"] != "awarded")
+
+    _bwic = _s["bwic"]
+
+    # ── Award cards (one per line) ─────────────────────────────────────────
+    _cards = []
+    for _line in _bwic.lines:
+        _aw = _line.award
+        if _aw is None:
+            continue
+        if _aw.is_dnt:
+            _cards.append(mo.callout(
+                mo.md(f"### {_line.line_id} · {_line.tranche_name}\n\n**DNT** — {_aw.dnt_reason}"),
+                kind="danger",
+            ))
+            continue
+        _award_md = (
+            f"### {_line.line_id} · {_line.tranche_name}  \n"
+            f"**🏆 AWARD** · {_aw.award_dealer} @ **{_aw.award_price:.4f}**"
+            + (f"  (DM {_aw.spread_at_award:.1f} bps)" if _aw.spread_at_award is not None else "")
+            + "  \n"
+            f"**📊 COVER** · "
+            + (f"{_aw.cover_dealer} @ {_aw.cover_price:.4f}" if _aw.cover_dealer else "_no cover_")
+            + (f"  (DM {_aw.spread_at_cover:.1f} bps)" if _aw.spread_at_cover is not None else "")
+        )
+        _cards.append(mo.callout(mo.md(_award_md), kind="success"))
+
+    # ── Color sheet ────────────────────────────────────────────────────────
+    _color_df = _bwic.color_sheet()
+
+    # ── Bid log (audit trail) ──────────────────────────────────────────────
+    _bid_log_df = _bwic.bid_log()
+    if not _bid_log_df.empty:
+        _bid_log_df = _bid_log_df.copy()
+        _bid_log_df["timestamp"] = _bid_log_df["timestamp"].apply(
+            lambda t: t.strftime("%Y-%m-%d %H:%M:%S") if hasattr(t, "strftime") else str(t)
+        )
+
+    # ── Downloads ──────────────────────────────────────────────────────────
+    _bwic_id_safe = (_s.get("bwic_id") or "bwic").replace(" ", "_")
+    _color_csv = _color_df.to_csv(index=False).encode("utf-8") if not _color_df.empty else b""
+    _bidlog_csv = _bid_log_df.to_csv(index=False).encode("utf-8") if not _bid_log_df.empty else b""
+
+    _color_dl = mo.download(
+        data=_color_csv,
+        filename=f"{_bwic_id_safe}_color_sheet.csv",
+        label="↓ Color sheet (CSV)",
+    )
+    _bidlog_dl = mo.download(
+        data=_bidlog_csv,
+        filename=f"{_bwic_id_safe}_bid_log.csv",
+        label="↓ Bid log (CSV)",
+    )
+
+    # ── Reset BWIC ─────────────────────────────────────────────────────────
+    def _reset(_):
+        set_state({
+            "bwic_id": "BWIC-2026-04-28-001",
+            "seller": "ABC Asset Mgmt",
+            "lines_config": [],
+            "bwic": None,
+            "phase": "setup",
+            "notifications": [],
+        })
+
+    _reset_btn = mo.ui.button(label="↺ New BWIC", kind="danger", on_click=_reset)
+
+    mo.vstack([
+        mo.md("## 🏆 BWIC Awarded"),
+        mo.vstack(_cards) if _cards else mo.md("_No awards._"),
+        mo.md("### Color sheet"),
+        mo.ui.table(_color_df, selection=None, page_size=30) if not _color_df.empty
+            else mo.md("_(no color)_"),
+        mo.md("### Bid log (audit trail)"),
+        mo.ui.table(_bid_log_df, selection=None, page_size=50) if not _bid_log_df.empty
+            else mo.md("_(no bids)_"),
+        mo.md("### Export"),
+        mo.hstack([_color_dl, _bidlog_dl], gap=1, justify="start"),
+        mo.md("---"),
+        mo.hstack([_reset_btn], justify="end"),
+    ])
+    return
+
+
 if __name__ == "__main__":
     app.run()
