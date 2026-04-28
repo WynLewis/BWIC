@@ -228,6 +228,22 @@ class BwicLine:
         """Alias for submit_bid — semantic for R2 revisions."""
         return self.submit_bid(dealer, price)
 
+    def delete_bid_by_idx(self, idx: int) -> None:
+        """
+        Remove the bid at position idx in self.bids.
+
+        Only allowed while that bid's round is still open (R1 open for R1 bids,
+        R2 open for R2 bids).  Raises BidError if the round is already closed.
+        """
+        if idx < 0 or idx >= len(self.bids):
+            raise BidError(f"Bid index {idx} out of range (0–{len(self.bids)-1})")
+        b = self.bids[idx]
+        if b.round == 1 and self.state != LineState.ROUND1_OPEN:
+            raise BidError("Cannot delete an R1 bid after R1 is closed")
+        if b.round == 2 and self.state != LineState.ROUND2_OPEN:
+            raise BidError("Cannot delete an R2 bid after R2 is closed")
+        self.bids = self.bids[:idx] + self.bids[idx + 1:]
+
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
@@ -400,6 +416,10 @@ class Bwic:
 
     def submit_bid(self, line_id: str, dealer: str, price: float) -> Bid:
         return self.get_line(line_id).submit_bid(dealer, price)
+
+    def delete_bid_by_idx(self, line_id: str, idx: int) -> None:
+        """Delete bid at position idx within the named line's bids list."""
+        self.get_line(line_id).delete_bid_by_idx(idx)
 
     # ------------------------------------------------------------------
     # Reporting — DataFrames for the marimo blotter

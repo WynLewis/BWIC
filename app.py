@@ -304,6 +304,22 @@ def _ticker(mo):
     return (tick,)
 
 
+@app.cell
+def _clear_state(mo):
+    # Incremented on successful bid submit when "Reset form" checkbox is on.
+    # _bid_stable_inputs depends on this so it recreates the inputs (resetting values).
+    get_clear, set_clear = mo.state(0)
+    return get_clear, set_clear
+
+
+@app.cell
+def _alert_state(mo):
+    # Tracks which timer thresholds have already fired an alert this round
+    # to avoid re-alerting on every tick.  Stored as set of (round, threshold_secs).
+    get_alerts, set_alerts = mo.state(set())
+    return get_alerts, set_alerts
+
+
 # ============================================================================
 # Stable form inputs (don't depend on mutable state — values persist)
 # ============================================================================
@@ -522,7 +538,7 @@ def _setup_actions(
 # ============================================================================
 
 @app.cell
-def _pricing_table(get_state, mo, pd, price_line_at):
+def _pricing_table(BondAnalytics, get_state, mo, pd, price_line_at):
     _s = get_state()
     _rows = []
     for _cfg in _s["lines_config"]:
@@ -546,10 +562,19 @@ def _pricing_table(get_state, mo, pd, price_line_at):
                 _r = _result.results.get(_label)
                 if _r is None:
                     continue
+                _dm_w = _r.dm_to_worst
                 _row[f"{_label} DM-Mat"] = round(_r.dm_to_maturity, 1) if _r.dm_to_maturity is not None else None
                 _row[f"{_label} DM-Call"] = round(_r.dm_to_call, 1) if _r.dm_to_call is not None else None
-                _row[f"{_label} DM-Worst"] = round(_r.dm_to_worst, 1) if _r.dm_to_worst is not None else None
+                _row[f"{_label} DM-Worst"] = round(_dm_w, 1) if _dm_w is not None else None
                 _row[f"{_label} WAL"] = round(_r.wal_to_maturity, 2) if _r.wal_to_maturity is not None else None
+                # Modified duration at par using DM-to-Worst
+                _stream = _cfg.get(f"{_label.lower()}_stream")
+                if _stream is not None and _dm_w is not None and _dm_w > -9999:
+                    try:
+                        _mdur = BondAnalytics(_stream).modified_duration(100.0, _dm_w)
+                        _row[f"{_label} MDur"] = round(_mdur, 2)
+                    except Exception:
+                        _row[f"{_label} MDur"] = None
         _rows.append(_row)
 
     _pricing_df = pd.DataFrame(_rows) if _rows else pd.DataFrame()
@@ -564,6 +589,73 @@ def _pricing_table(get_state, mo, pd, price_line_at):
         else mo.md("_No lines yet — add one above or click_ **Load Demo**.")
     )
     return (pricing_table_md,)
+
+
+# ============================================================================
+# Dealer roster manager (editable in the UI, persisted to dealers.json)
+# ============================================================================
+
+@app.cell
+def _roster_manager(mo):
+    import json as _rjson, os as _ros
+    _roster_path = _ros.path.join(_ros.path.dirname(__file__), "dealers.json")
+
+    def _load_roster():
+        try:
+            with open(_roster_path) as _f:
+                return _rjson.load(_f)
+        except Exception:
+            return ["GS","JPM","MS","BofA","Citi","Barclays","DB","Wells",
+                    "BMO","CS","Nomura","Jefferies","Mizuho","RBC","BNP",
+                    "SocGen","HSBC","Natixis","MUFG","Other..."]
+
+    def _save_roster(roster):
+        with open(_roster_path, "w") as _f:
+            _rjson.dump(roster, _f, indent=2)
+
+    _roster_now = _load_roster()
+
+    add_dealer_inp = mo.ui.text(value="", label="New dealer name", placeholder="e.g. Barclays")
+    remove_dealer_dd = mo.ui.dropdown(
+        options=_roster_now,
+        value=_roster_now[0] if _roster_now else None,
+        label="Remove dealer",
+    )
+
+    def _add_dealer(_):
+        name = (add_dealer_inp.value or "").strip()
+        if not name:
+            return
+        r = _load_roster()
+        if name not in r:
+            # Insert before "Other..." if present
+            if "Other..." in r:
+                r.insert(r.index("Other..."), name)
+            else:
+                r.append(name)
+            _save_roster(r)
+
+    def _remove_dealer(_):
+        name = remove_dealer_dd.value
+        if not name:
+            return
+        r = _load_roster()
+        if name in r:
+            r.remove(name)
+            _save_roster(r)
+
+    _add_dealer_btn    = mo.ui.button(label="Add →", kind="success", on_click=_add_dealer)
+    _remove_dealer_btn = mo.ui.button(label="Remove ×", kind="danger", on_click=_remove_dealer)
+
+    roster_manager_md = mo.accordion({
+        "👥 Manage dealer roster": mo.vstack([
+            mo.md(f"Current roster: {', '.join(_roster_now)}"),
+            mo.hstack([add_dealer_inp, _add_dealer_btn], gap=1, justify="start"),
+            mo.hstack([remove_dealer_dd, _remove_dealer_btn], gap=1, justify="start"),
+            mo.md("_Changes take effect on next form render (reload roster)._"),
+        ])
+    })
+    return (roster_manager_md,)
 
 
 # ============================================================================
@@ -596,6 +688,7 @@ def _setup_section(
     rating_inp,
     reinvest_end_inp,
     reserve_inp,
+    roster_manager_md,
     save_dl,
     seller_input,
     settle_inp,
@@ -626,6 +719,7 @@ def _setup_section(
             mo.md("---"),
             mo.md("### Save / Load BWIC state"),
             mo.hstack([save_dl, load_upload, load_btn], gap=2, justify="start"),
+            roster_manager_md,
             mo.md("---"),
             mo.hstack([open_r1_btn], justify="end"),
         ]
@@ -655,15 +749,22 @@ def _notifications(get_state, mo):
 # ============================================================================
 
 @app.cell
-def _bid_stable_inputs(mo):
-    # Common CLO BWIC counterparties — extend in code as your roster grows.
-    DEALER_ROSTER = [
-        "GS", "JPM", "MS", "BofA", "Citi", "Barclays", "DB", "Wells",
-        "BMO", "CS", "Nomura", "Jefferies", "Mizuho", "RBC", "BNP",
-        "SocGen", "HSBC", "Natixis", "MUFG", "Other...",
-    ]
+def _bid_stable_inputs(mo, get_clear):
+    _ = get_clear()  # depend on clear counter — inputs recreate at par when triggered
+    # Dealer roster loaded from dealers.json; falls back to built-in defaults
+    import json as _json, os as _os
+    _roster_path = _os.path.join(_os.path.dirname(__file__), "dealers.json")
+    try:
+        with open(_roster_path) as _f:
+            DEALER_ROSTER = _json.load(_f)
+    except Exception:
+        DEALER_ROSTER = [
+            "GS", "JPM", "MS", "BofA", "Citi", "Barclays", "DB", "Wells",
+            "BMO", "CS", "Nomura", "Jefferies", "Mizuho", "RBC", "BNP",
+            "SocGen", "HSBC", "Natixis", "MUFG", "Other...",
+        ]
     dealer_dd = mo.ui.dropdown(
-        options=DEALER_ROSTER, value="GS",
+        options=DEALER_ROSTER, value=DEALER_ROSTER[0] if DEALER_ROSTER else "GS",
         label="Dealer",
     )
     dealer_other_inp = mo.ui.text(value="", label="Other dealer (when 'Other...' picked)")
@@ -671,7 +772,8 @@ def _bid_stable_inputs(mo):
         value=100.0, step=0.0625, start=50.0, stop=150.0,
         label="Bid Price (% par)",
     )
-    return DEALER_ROSTER, dealer_dd, dealer_other_inp, price_inp
+    auto_clear_chk = mo.ui.checkbox(value=False, label="Reset form after submit")
+    return DEALER_ROSTER, auto_clear_chk, dealer_dd, dealer_other_inp, price_inp
 
 
 # ============================================================================
@@ -680,14 +782,49 @@ def _bid_stable_inputs(mo):
 
 @app.cell
 def _r1_section(
-    BidError, BondAnalytics, bid_sanity, countdown, datetime, dealer_dd,
-    dealer_other_inp, fmt, get_state, mo, pd, price_inp, price_line_at,
-    resolve_dealer, set_state, tick, timedelta,
+    BidError, BondAnalytics, auto_clear_chk, bid_sanity, countdown,
+    datetime, dealer_dd, dealer_other_inp, fmt, get_alerts, get_clear,
+    get_state, mo, pd, price_inp, price_line_at, resolve_dealer,
+    set_alerts, set_clear, set_state, tick, timedelta,
 ):
     _ = tick.value  # subscribe to 1Hz tick so the countdown re-renders
     _s = get_state()
     mo.stop(_s["phase"] != "r1_open")
-    _cd_text, _cd_kind = countdown(_s.get("r1_end_time"), datetime.now())
+    _now = datetime.now()
+    _cd_text, _cd_kind = countdown(_s.get("r1_end_time"), _now)
+
+    # ── Audio/visual alerts at T-5min, T-1min, T-0 ────────────────────────
+    _alert_js = mo.Html("")
+    if _s.get("r1_end_time"):
+        _secs_left = int((_s["r1_end_time"] - _now).total_seconds())
+        _fired = get_alerts()
+        _thresholds = {300: ("R1", 300), 60: ("R1", 60), 0: ("R1", 0)}
+        for _thresh, _key in _thresholds.items():
+            if _secs_left <= _thresh and _key not in _fired:
+                _fired = _fired | {_key}
+                set_alerts(_fired)
+                _freq = 880 if _thresh == 0 else (660 if _thresh == 60 else 440)
+                _dur  = 600 if _thresh == 0 else 300
+                _alert_js = mo.Html(f"""
+<script>
+(function(){{
+  try {{
+    var ctx = new (window.AudioContext||window.webkitAudioContext)();
+    var o = ctx.createOscillator(); var g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = {_freq}; g.gain.value = 0.25;
+    o.start(); setTimeout(function(){{ o.stop(); ctx.close(); }}, {_dur});
+  }} catch(e) {{}}
+}})();
+</script>
+<style>
+@keyframes flash-warn {{ 0%,100%{{background:#fff}} 50%{{background:#ffe082}} }}
+.bwic-alert-flash {{ animation: flash-warn 0.5s ease 3; }}
+</style>
+<div class="bwic-alert-flash" style="padding:4px 8px;border-radius:4px;font-weight:bold;color:#b71c1c">
+  ⏰ R1 {'EXPIRED' if _thresh == 0 else f'T-{_thresh//60}min'} alert
+</div>""")
+                break
 
     def _extend_r1(_):
         _st = get_state()
@@ -706,36 +843,57 @@ def _r1_section(
     # ── Live DM preview ────────────────────────────────────────────────────
     _sel   = r1_line_sel.value
     _price = price_inp.value
+    _cfg   = next((c for c in _lines if c["line_id"] == _sel), None) if _sel else None
     _dm_txt = "Select a line to see live DM"
-    if _sel:
-        _cfg = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg:
-            try:
-                _pr = price_line_at(_cfg, _price)
-                if _pr:
-                    _parts = []
-                    for _lbl in ("Market", "Base"):
-                        _r = _pr.results.get(_lbl)
-                        if _r and _r.dm_to_worst is not None:
-                            _parts.append(
-                                f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
-                                f"DM-M: {fmt(_r.dm_to_maturity)} | "
-                                f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
-                            )
-                    _dm_txt = " · ".join(_parts) if _parts else "No streams loaded for this line"
-            except Exception as _exc:
-                _dm_txt = f"Pricing error: {_exc}"
+    if _cfg:
+        try:
+            _pr = price_line_at(_cfg, _price)
+            if _pr:
+                _parts = []
+                for _lbl in ("Market", "Base"):
+                    _r = _pr.results.get(_lbl)
+                    if _r and _r.dm_to_worst is not None:
+                        _parts.append(
+                            f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
+                            f"DM-M: {fmt(_r.dm_to_maturity)} | "
+                            f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
+                        )
+                _dm_txt = " · ".join(_parts) if _parts else "No streams loaded for this line"
+        except Exception as _exc:
+            _dm_txt = f"Pricing error: {_exc}"
+
+    # ── DM sensitivity bracket (±1 / ±5 bps around current price) ─────────
+    _dm_sens_md = mo.md("")
+    if _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_sens = BondAnalytics(_cfg["market_stream"])
+            _dm_cur = _ba_sens.dm_from_price(_price)
+            if _dm_cur > -9999:
+                _sens_rows = []
+                for _d in (-5, -1, 0, 1, 5):
+                    _dm_t = _dm_cur + _d
+                    _px   = _ba_sens.price_from_dm(_dm_t) if _d != 0 else _price
+                    _sens_rows.append({
+                        "Δ DM": f"{_d:+d}" if _d != 0 else "→ bid",
+                        "DM (bps)": f"{_dm_t:.1f}",
+                        "Price": f"{_px:.4f}",
+                        "Δ Price": f"{(_px - _price):+.4f}" if _d != 0 else "—",
+                    })
+                _dm_sens_md = mo.vstack([
+                    mo.md("**DM sensitivity (Market, at bid price)**"),
+                    mo.ui.table(pd.DataFrame(_sens_rows), selection=None),
+                ])
+        except Exception:
+            pass
 
     # ── Bid sanity warnings (live as user types price/line) ───────────────
     _warn_lines = []
-    if _sel and _bwic:
-        _cfg_w = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg_w and _cfg_w.get("market_stream") is not None:
-            try:
-                _ba_w = BondAnalytics(_cfg_w["market_stream"])
-                _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg_w.get("market_spread"), _ba_w)
-            except Exception:
-                pass
+    if _sel and _bwic and _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_w = BondAnalytics(_cfg["market_stream"])
+            _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg.get("market_spread"), _ba_w)
+        except Exception:
+            pass
 
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _submit(_):
@@ -747,6 +905,8 @@ def _r1_section(
         try:
             _b.submit_bid(r1_line_sel.value, _dealer, price_inp.value)
             set_state({**_st, "bwic": _b, "notifications": []})
+            if auto_clear_chk.value:
+                set_clear(get_clear() + 1)
         except BidError as _e:
             set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
 
@@ -761,18 +921,53 @@ def _r1_section(
     _submit_btn   = mo.ui.button(label="Submit Bid ▶",  kind="success", on_click=_submit)
     _close_r1_btn = mo.ui.button(label="Close Round 1", kind="warn",    on_click=_close_r1)
 
-    # ── Blotter (live) ─────────────────────────────────────────────────────
+    # ── Blotter (live) — with bid index for deletion ───────────────────────
     _bid_rows = []
+    _global_bid_idx = 0
     if _bwic:
         for _line in _bwic.lines:
-            for _bid in _line.round1_bids():
+            for _li, _bid in enumerate(_line.bids):
+                if _bid.round != 1:
+                    _global_bid_idx += 1
+                    continue
                 _bid_rows.append({
+                    "#":      _global_bid_idx,
                     "Line":   _bid.line_id,
                     "Dealer": _bid.dealer,
                     "Price":  round(_bid.price, 4),
                     "Time":   _bid.timestamp.strftime("%H:%M:%S"),
                 })
-    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
+                _global_bid_idx += 1
+    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(
+        columns=["#", "Line", "Dealer", "Price", "Time"])
+
+    _blotter_tbl = mo.ui.table(_blotter_df, selection="single", page_size=30)
+
+    def _delete_bid(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None or not _blotter_tbl.value or len(_blotter_tbl.value) == 0:
+            return
+        _row = _blotter_tbl.value.iloc[0]
+        _lid = _row["Line"]
+        try:
+            _tgt_line = _b.get_line(_lid)
+            _tgt_idx  = int(_row["#"])
+            # Recompute per-line index from global index
+            _line_bids = [
+                (gi, b) for gi, b in enumerate(
+                    sum([list(l.bids) for l in _b.lines], [])
+                )
+                if b.line_id == _lid
+            ]
+            _local_idx = next((i for i, (gi, _) in enumerate(_line_bids) if gi == _tgt_idx), None)
+            if _local_idx is not None:
+                _b.delete_bid_by_idx(_lid, _local_idx)
+                set_state({**_st, "bwic": _b, "notifications": []})
+        except Exception as _ex:
+            set_state({**_st, "notifications": _st["notifications"] + [f"Delete failed: {_ex}"]})
+
+    _delete_btn = mo.ui.button(label="Delete selected bid", kind="danger", on_click=_delete_bid)
 
     _warn_panel = (
         mo.callout(
@@ -784,16 +979,19 @@ def _r1_section(
 
     mo.vstack([
         mo.md("## Round 1 — Bid Intake"),
+        _alert_js,
         mo.hstack([
             mo.callout(mo.md(_cd_text), kind=_cd_kind),
             _extend_r1_btn, tick,
         ], gap=1, justify="start"),
-        mo.hstack([r1_line_sel, dealer_dd, dealer_other_inp, price_inp, _submit_btn],
-                  gap=1, justify="start"),
+        mo.hstack([r1_line_sel, dealer_dd, dealer_other_inp, price_inp,
+                   auto_clear_chk, _submit_btn], gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
+        _dm_sens_md,
         _warn_panel,
         mo.md("### Live bids"),
-        mo.ui.table(_blotter_df, selection=None, page_size=30),
+        _blotter_tbl,
+        mo.hstack([_delete_btn], justify="start"),
         mo.md("---"),
         mo.hstack([_close_r1_btn], justify="end"),
     ])
@@ -852,19 +1050,131 @@ def _r1_results(datetime, get_state, mo, pd, r2_dur_inp, set_state, timedelta):
 
 
 # ============================================================================
+# WAL sensitivity — re-prices the demo stream under 4 CPR scenarios
+# ============================================================================
+
+@app.cell
+def _wal_sensitivity(BondAnalytics, build_demo_stream, get_state, mo, pd, price_line_at):
+    _s = get_state()
+    mo.stop(_s["phase"] not in ("r1_closed", "r2_open", "awarded"))
+    _lines = _s["lines_config"]
+    mo.stop(not _lines)
+
+    _cpr_scenarios = [
+        ("10 CPR (fast)", 10),
+        ("15 CPR (base)", 15),
+        ("20 CPR (market)", 20),
+        ("25 CPR (stress)", 25),
+    ]
+
+    _wal_rows = []
+    for _cfg in _lines:
+        # If this is a demo line (stream was built with build_demo_stream), rebuild at each CPR.
+        # For real Intex streams we can only show the already-projected WAL.
+        _qs = _cfg.get("quoted_spread", 115) or 115
+        _reinvest_months = 48  # default for demo
+
+        _row = {
+            "Line":    _cfg["line_id"],
+            "Deal":    _cfg.get("deal_name", ""),
+            "Rating":  _cfg.get("rating", ""),
+            "Tranche": _cfg.get("tranche", ""),
+        }
+
+        for _lbl, _cpr in _cpr_scenarios:
+            # Approximate amort months from CPR: faster prepay → shorter amort window
+            _amort_months = max(6, int(24 * (20 / max(_cpr, 1))))
+            try:
+                _s_cpr = build_demo_stream(
+                    spread_bps=int(_qs),
+                    reinvest_months=_reinvest_months,
+                    amort_months=_amort_months,
+                )
+                _ba = BondAnalytics(_s_cpr)
+                _w  = _ba.wal()
+                _row[f"WAL @ {_cpr}"] = round(_w, 2)
+                # DM at par for this scenario
+                _dm = _ba.dm_from_price(100.0)
+                _row[f"DM @ {_cpr}"] = round(_dm, 1) if _dm > -9999 else None
+            except Exception:
+                _row[f"WAL @ {_cpr}"] = None
+                _row[f"DM @ {_cpr}"] = None
+
+        # Also show actual WAL from uploaded Market stream if available
+        _mkt = _cfg.get("market_stream")
+        if _mkt is not None:
+            try:
+                _ba_m = BondAnalytics(_mkt)
+                _row["WAL (Intex mkt)"] = round(_ba_m.wal(), 2)
+            except Exception:
+                _row["WAL (Intex mkt)"] = None
+
+        _wal_rows.append(_row)
+
+    _wal_df = pd.DataFrame(_wal_rows) if _wal_rows else pd.DataFrame()
+
+    mo.accordion({
+        "📈 WAL sensitivity (CPR scenarios — demo engine)": (
+            mo.vstack([
+                mo.md("WAL and DM-at-par estimated via synthetic amortization at each CPR rate.  "
+                      "Real Intex streams show actual projected WAL under 'WAL (Intex mkt)'."),
+                mo.ui.table(_wal_df, selection=None, page_size=20),
+            ])
+            if not _wal_df.empty else mo.md("_(no lines)_")
+        )
+    })
+    return
+
+
+# ============================================================================
 # Round 2 — bid entry, live DM preview, blotter, close button
 # ============================================================================
 
 @app.cell
 def _r2_section(
-    BidError, BondAnalytics, bid_sanity, countdown, datetime, dealer_dd,
-    dealer_other_inp, fmt, get_state, mo, pd, price_inp, price_line_at,
-    resolve_dealer, set_state, tick, timedelta,
+    BidError, BondAnalytics, auto_clear_chk, bid_sanity, countdown,
+    datetime, dealer_dd, dealer_other_inp, fmt, get_alerts, get_clear,
+    get_state, mo, pd, price_inp, price_line_at, resolve_dealer,
+    set_alerts, set_clear, set_state, tick, timedelta,
 ):
     _ = tick.value
     _s = get_state()
     mo.stop(_s["phase"] != "r2_open")
-    _cd_text, _cd_kind = countdown(_s.get("r2_end_time"), datetime.now())
+    _now = datetime.now()
+    _cd_text, _cd_kind = countdown(_s.get("r2_end_time"), _now)
+
+    # ── Audio/visual alerts at T-5min, T-1min, T-0 ────────────────────────
+    _alert_js = mo.Html("")
+    if _s.get("r2_end_time"):
+        _secs_left = int((_s["r2_end_time"] - _now).total_seconds())
+        _fired = get_alerts()
+        _thresholds = {300: ("R2", 300), 60: ("R2", 60), 0: ("R2", 0)}
+        for _thresh, _key in _thresholds.items():
+            if _secs_left <= _thresh and _key not in _fired:
+                _fired = _fired | {_key}
+                set_alerts(_fired)
+                _freq = 880 if _thresh == 0 else (660 if _thresh == 60 else 440)
+                _dur  = 600 if _thresh == 0 else 300
+                _alert_js = mo.Html(f"""
+<script>
+(function(){{
+  try {{
+    var ctx = new (window.AudioContext||window.webkitAudioContext)();
+    var o = ctx.createOscillator(); var g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = {_freq}; g.gain.value = 0.25;
+    o.start(); setTimeout(function(){{ o.stop(); ctx.close(); }}, {_dur});
+  }} catch(e) {{}}
+}})();
+</script>
+<style>
+@keyframes flash-warn {{ 0%,100%{{background:#fff}} 50%{{background:#ffe082}} }}
+.bwic-alert-flash {{ animation: flash-warn 0.5s ease 3; }}
+</style>
+<div class="bwic-alert-flash" style="padding:4px 8px;border-radius:4px;font-weight:bold;color:#b71c1c">
+  ⏰ R2 {'EXPIRED' if _thresh == 0 else f'T-{_thresh//60}min'} alert
+</div>""")
+                break
 
     def _extend_r2(_):
         _st = get_state()
@@ -876,7 +1186,6 @@ def _r2_section(
     _bwic  = _s["bwic"]
     _lines = _s["lines_config"]
 
-    # Only advancing dealers matter — show per-line advancing sets
     _adv_map: dict[str, list[str]] = {}
     if _bwic:
         for _line in _bwic.lines:
@@ -890,36 +1199,57 @@ def _r2_section(
     # ── Live DM preview ────────────────────────────────────────────────────
     _sel   = r2_line_sel.value
     _price = price_inp.value
+    _cfg   = next((c for c in _lines if c["line_id"] == _sel), None) if _sel else None
     _dm_txt = "Select a line to see live DM"
-    if _sel:
-        _cfg = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg:
-            try:
-                _pr = price_line_at(_cfg, _price)
-                if _pr:
-                    _parts = []
-                    for _lbl in ("Market", "Base"):
-                        _r = _pr.results.get(_lbl)
-                        if _r and _r.dm_to_worst is not None:
-                            _parts.append(
-                                f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
-                                f"DM-M: {fmt(_r.dm_to_maturity)} | "
-                                f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
-                            )
-                    _dm_txt = " · ".join(_parts) if _parts else "No streams for this line"
-            except Exception as _exc:
-                _dm_txt = f"Pricing error: {_exc}"
+    if _cfg:
+        try:
+            _pr = price_line_at(_cfg, _price)
+            if _pr:
+                _parts = []
+                for _lbl in ("Market", "Base"):
+                    _r = _pr.results.get(_lbl)
+                    if _r and _r.dm_to_worst is not None:
+                        _parts.append(
+                            f"**{_lbl}** DM-W: {fmt(_r.dm_to_worst)} | "
+                            f"DM-M: {fmt(_r.dm_to_maturity)} | "
+                            f"WAL: {fmt(_r.wal_to_maturity, 2)}y"
+                        )
+                _dm_txt = " · ".join(_parts) if _parts else "No streams for this line"
+        except Exception as _exc:
+            _dm_txt = f"Pricing error: {_exc}"
+
+    # ── DM sensitivity bracket ─────────────────────────────────────────────
+    _dm_sens_md = mo.md("")
+    if _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_sens = BondAnalytics(_cfg["market_stream"])
+            _dm_cur = _ba_sens.dm_from_price(_price)
+            if _dm_cur > -9999:
+                _sens_rows = []
+                for _d in (-5, -1, 0, 1, 5):
+                    _dm_t = _dm_cur + _d
+                    _px   = _ba_sens.price_from_dm(_dm_t) if _d != 0 else _price
+                    _sens_rows.append({
+                        "Δ DM": f"{_d:+d}" if _d != 0 else "→ bid",
+                        "DM (bps)": f"{_dm_t:.1f}",
+                        "Price": f"{_px:.4f}",
+                        "Δ Price": f"{(_px - _price):+.4f}" if _d != 0 else "—",
+                    })
+                _dm_sens_md = mo.vstack([
+                    mo.md("**DM sensitivity (Market, at bid price)**"),
+                    mo.ui.table(pd.DataFrame(_sens_rows), selection=None),
+                ])
+        except Exception:
+            pass
 
     # ── Bid sanity warnings ───────────────────────────────────────────────
     _warn_lines = []
-    if _sel and _bwic:
-        _cfg_w = next((c for c in _lines if c["line_id"] == _sel), None)
-        if _cfg_w and _cfg_w.get("market_stream") is not None:
-            try:
-                _ba_w = BondAnalytics(_cfg_w["market_stream"])
-                _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg_w.get("market_spread"), _ba_w)
-            except Exception:
-                pass
+    if _sel and _bwic and _cfg and _cfg.get("market_stream") is not None:
+        try:
+            _ba_w = BondAnalytics(_cfg["market_stream"])
+            _warn_lines = bid_sanity(_bwic, _sel, _price, _cfg.get("market_spread"), _ba_w)
+        except Exception:
+            pass
 
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _submit_r2(_):
@@ -931,6 +1261,8 @@ def _r2_section(
         try:
             _b.submit_bid(r2_line_sel.value, _dealer, price_inp.value)
             set_state({**_st, "bwic": _b, "notifications": []})
+            if auto_clear_chk.value:
+                set_clear(get_clear() + 1)
         except BidError as _e:
             set_state({**_st, "notifications": _st["notifications"] + [str(_e)]})
 
@@ -945,20 +1277,52 @@ def _r2_section(
     _submit_btn   = mo.ui.button(label="Submit Bid ▶",  kind="success", on_click=_submit_r2)
     _close_r2_btn = mo.ui.button(label="Close Round 2", kind="warn",    on_click=_close_r2)
 
-    # ── R2 blotter ─────────────────────────────────────────────────────────
+    # ── R2 blotter with delete ─────────────────────────────────────────────
     _bid_rows = []
+    _global_bid_idx = 0
     if _bwic:
         for _line in _bwic.lines:
-            for _bid in _line.round2_bids():
+            for _bi, _bid in enumerate(_line.bids):
+                if _bid.round != 2:
+                    _global_bid_idx += 1
+                    continue
                 _bid_rows.append({
+                    "#":      _global_bid_idx,
                     "Line":   _bid.line_id,
                     "Dealer": _bid.dealer,
                     "Price":  round(_bid.price, 4),
                     "Time":   _bid.timestamp.strftime("%H:%M:%S"),
                 })
-    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(columns=["Line","Dealer","Price","Time"])
+                _global_bid_idx += 1
+    _blotter_df = pd.DataFrame(_bid_rows) if _bid_rows else pd.DataFrame(
+        columns=["#", "Line", "Dealer", "Price", "Time"])
 
-    # ── Advancing dealers reminder ─────────────────────────────────────────
+    _blotter_tbl = mo.ui.table(_blotter_df, selection="single", page_size=30)
+
+    def _delete_r2_bid(_):
+        _st = get_state()
+        _b  = _st.get("bwic")
+        if _b is None or not _blotter_tbl.value or len(_blotter_tbl.value) == 0:
+            return
+        _row = _blotter_tbl.value.iloc[0]
+        _lid = _row["Line"]
+        try:
+            _tgt_idx = int(_row["#"])
+            _line_bids = [
+                (gi, b) for gi, b in enumerate(
+                    sum([list(l.bids) for l in _b.lines], [])
+                )
+                if b.line_id == _lid
+            ]
+            _local_idx = next((i for i, (gi, _) in enumerate(_line_bids) if gi == _tgt_idx), None)
+            if _local_idx is not None:
+                _b.delete_bid_by_idx(_lid, _local_idx)
+                set_state({**_st, "bwic": _b, "notifications": []})
+        except Exception as _ex:
+            set_state({**_st, "notifications": _st["notifications"] + [f"Delete failed: {_ex}"]})
+
+    _delete_btn = mo.ui.button(label="Delete selected bid", kind="danger", on_click=_delete_r2_bid)
+
     _adv_lines = [f"**{lid}**: {', '.join(adv)}" for lid, adv in _adv_map.items() if adv]
 
     _warn_panel = (
@@ -971,17 +1335,20 @@ def _r2_section(
 
     mo.vstack([
         mo.md("## Round 2 — Bid Intake"),
+        _alert_js,
         mo.hstack([
             mo.callout(mo.md(_cd_text), kind=_cd_kind),
             _extend_r2_btn, tick,
         ], gap=1, justify="start"),
         mo.callout(mo.md("Advancing dealers: " + " · ".join(_adv_lines)), kind="neutral"),
-        mo.hstack([r2_line_sel, dealer_dd, dealer_other_inp, price_inp, _submit_btn],
-                  gap=1, justify="start"),
+        mo.hstack([r2_line_sel, dealer_dd, dealer_other_inp, price_inp,
+                   auto_clear_chk, _submit_btn], gap=1, justify="start"),
         mo.callout(mo.md(_dm_txt), kind="neutral"),
+        _dm_sens_md,
         _warn_panel,
         mo.md("### R2 bids submitted"),
-        mo.ui.table(_blotter_df, selection=None, page_size=30),
+        _blotter_tbl,
+        mo.hstack([_delete_btn], justify="start"),
         mo.md("---"),
         mo.hstack([_close_r2_btn], justify="end"),
     ])
@@ -1052,7 +1419,7 @@ def _award_section(get_state, mo, pd, set_state):
             lambda t: t.strftime("%Y-%m-%d %H:%M:%S") if hasattr(t, "strftime") else str(t)
         )
 
-    # ── Downloads ──────────────────────────────────────────────────────────
+    # ── CSV downloads ──────────────────────────────────────────────────────
     _bwic_id_safe = (_s.get("bwic_id") or "bwic").replace(" ", "_")
     _color_csv = _color_df.to_csv(index=False).encode("utf-8") if not _color_df.empty else b""
     _bidlog_csv = _bid_log_df.to_csv(index=False).encode("utf-8") if not _bid_log_df.empty else b""
@@ -1067,6 +1434,176 @@ def _award_section(get_state, mo, pd, set_state):
         filename=f"{_bwic_id_safe}_bid_log.csv",
         label="↓ Bid log (CSV)",
     )
+
+    # ── Excel export (openpyxl — conditional formatting) ──────────────────
+    def _build_excel():
+        import io as _io
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, numbers
+        from openpyxl.formatting.rule import ColorScaleRule
+        wb = openpyxl.Workbook()
+        # Sheet 1: Color sheet
+        ws1 = wb.active
+        ws1.title = "Color Sheet"
+        if not _color_df.empty:
+            ws1.append(list(_color_df.columns))
+            for _, r in _color_df.iterrows():
+                ws1.append([r[c] for c in _color_df.columns])
+            # Color-scale on dm_cover column if present
+            if "dm_cover" in _color_df.columns:
+                _col_idx = list(_color_df.columns).index("dm_cover") + 1
+                _col_letter = openpyxl.utils.get_column_letter(_col_idx)
+                _last_row = len(_color_df) + 1
+                ws1.conditional_formatting.add(
+                    f"{_col_letter}2:{_col_letter}{_last_row}",
+                    ColorScaleRule(
+                        start_type="min", start_color="63BE7B",
+                        mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                        end_type="max", end_color="F8696B",
+                    ),
+                )
+        # Sheet 2: Bid log
+        ws2 = wb.create_sheet("Bid Log")
+        if not _bid_log_df.empty:
+            ws2.append(list(_bid_log_df.columns))
+            for _, r in _bid_log_df.iterrows():
+                ws2.append([r[c] for c in _bid_log_df.columns])
+        # Sheet 3: Award summary
+        ws3 = wb.create_sheet("Awards")
+        _aw_header = ["Line","Tranche","Award Dealer","Award Price","DM Award","Cover Dealer","Cover Price","DM Cover","DNT"]
+        ws3.append(_aw_header)
+        for _line in _bwic.lines:
+            if _line.award:
+                _a = _line.award
+                ws3.append([
+                    _line.line_id, _line.tranche_name,
+                    _a.award_dealer, _a.award_price, _a.spread_at_award,
+                    _a.cover_dealer, _a.cover_price, _a.spread_at_cover,
+                    "Yes" if _a.is_dnt else "No",
+                ])
+        buf = _io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    try:
+        _excel_bytes = _build_excel()
+    except Exception as _xex:
+        _excel_bytes = b""
+    _excel_dl = mo.download(
+        data=_excel_bytes,
+        filename=f"{_bwic_id_safe}_bwic.xlsx",
+        label="↓ BWIC workbook (XLSX)",
+    )
+
+    # ── PDF one-pager (reportlab) ─────────────────────────────────────────
+    def _build_pdf():
+        import io as _io
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        buf = _io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=letter,
+                                leftMargin=0.75*inch, rightMargin=0.75*inch,
+                                topMargin=0.75*inch, bottomMargin=0.75*inch)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Title
+        story.append(Paragraph(f"BWIC Award Sheet — {_s.get('bwic_id','')}", styles["Title"]))
+        story.append(Paragraph(f"Seller: {_s.get('seller','')} | Date: {_bwic.bwic_date}", styles["Normal"]))
+        story.append(Spacer(1, 0.2*inch))
+
+        # Award table
+        _pdf_data = [["Line","Tranche","Face $MM","Award Dealer","Price","DM (bps)","Cover Dealer","Cover Price","DM Cover","vs Mkt"]]
+        for _line in _bwic.lines:
+            _a = _line.award
+            if _a is None:
+                continue
+            _cf = _cfg_by_id.get(_line.line_id, {})
+            _mkt = _cf.get("market_spread")
+            _face_mm = f"{_line.current_face/1e6:.0f}"
+            if _a.is_dnt:
+                _pdf_data.append([_line.line_id, _line.tranche_name, _face_mm,
+                                   "DNT", "—", "—", "—", "—", "—", "—"])
+            else:
+                _vs = ""
+                if _a.spread_at_award is not None and _mkt:
+                    _d = _mkt - _a.spread_at_award
+                    _vs = f"{_d:+.1f}"
+                _pdf_data.append([
+                    _line.line_id, _line.tranche_name, _face_mm,
+                    _a.award_dealer or "—",
+                    f"{_a.award_price:.4f}" if _a.award_price else "—",
+                    f"{_a.spread_at_award:.1f}" if _a.spread_at_award else "—",
+                    _a.cover_dealer or "—",
+                    f"{_a.cover_price:.4f}" if _a.cover_price else "—",
+                    f"{_a.spread_at_cover:.1f}" if _a.spread_at_cover else "—",
+                    _vs,
+                ])
+        tbl = Table(_pdf_data, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#2D5986")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#EEF4FB")]),
+            ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 0.15*inch))
+        story.append(Paragraph("Confidential — for compliance archive only.", styles["Italic"]))
+        doc.build(story)
+        return buf.getvalue()
+
+    try:
+        _pdf_bytes = _build_pdf()
+    except Exception as _pex:
+        _pdf_bytes = b""
+    _pdf_dl = mo.download(
+        data=_pdf_bytes,
+        filename=f"{_bwic_id_safe}_award.pdf",
+        label="↓ Award one-pager (PDF)",
+    )
+
+    # ── Dealer participation stats (append to dealer_stats.jsonl) ─────────
+    import os as _dsos, json as _dsjson
+    _stats_path = _dsos.path.join(_dsos.path.dirname(__file__), "dealer_stats.jsonl")
+    _bwic_id_str = _s.get("bwic_id") or "?"
+
+    def _log_stats(_):
+        _st = get_state()
+        _b = _st.get("bwic")
+        if _b is None:
+            return
+        _entry = {
+            "bwic_id": _bwic_id_str,
+            "date": str(_b.bwic_date),
+            "dealers": {},
+        }
+        for _l in _b.lines:
+            _best = _l._best_bid_per_dealer()
+            for _dlr, _bid in _best.items():
+                rec = _entry["dealers"].setdefault(_dlr, {"bids": 0, "won": 0, "covered": 0, "face_bid": 0, "face_won": 0})
+                rec["bids"] += 1
+                rec["face_bid"] += _l.current_face
+                if _l.award and not _l.award.is_dnt:
+                    if _l.award.award_dealer == _dlr:
+                        rec["won"] += 1
+                        rec["face_won"] += _l.current_face
+                    elif _l.award.cover_dealer == _dlr:
+                        rec["covered"] += 1
+        try:
+            with open(_stats_path, "a") as _sf:
+                _sf.write(_dsjson.dumps(_entry) + "\n")
+            set_state({**_st, "notifications": _st["notifications"] + [f"Dealer stats logged to dealer_stats.jsonl"]})
+        except Exception as _e:
+            set_state({**_st, "notifications": _st["notifications"] + [f"Stats log failed: {_e}"]})
+
+    _log_stats_btn = mo.ui.button(label="Log dealer stats", kind="neutral", on_click=_log_stats)
 
     # ── Reset BWIC ─────────────────────────────────────────────────────────
     def _reset(_):
@@ -1091,10 +1628,64 @@ def _award_section(get_state, mo, pd, set_state):
         mo.ui.table(_bid_log_df, selection=None, page_size=50) if not _bid_log_df.empty
             else mo.md("_(no bids)_"),
         mo.md("### Export"),
-        mo.hstack([_color_dl, _bidlog_dl], gap=1, justify="start"),
+        mo.hstack([_color_dl, _bidlog_dl, _excel_dl, _pdf_dl], gap=1, justify="start"),
+        mo.hstack([_log_stats_btn], justify="start"),
         mo.md("---"),
         mo.hstack([_reset_btn], justify="end"),
     ])
+    return
+
+
+# ============================================================================
+# Dealer participation stats viewer
+# ============================================================================
+
+@app.cell
+def _dealer_stats_view(mo, pd):
+    import os as _stos, json as _stjson
+    _stats_path = _stos.path.join(_stos.path.dirname(__file__), "dealer_stats.jsonl")
+
+    _all_records = []
+    try:
+        with open(_stats_path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line:
+                    _all_records.append(_stjson.loads(_line))
+    except FileNotFoundError:
+        pass
+
+    _stats_rows = []
+    if _all_records:
+        _agg: dict = {}
+        for _rec in _all_records:
+            for _dlr, _d in _rec.get("dealers", {}).items():
+                r = _agg.setdefault(_dlr, {"Dealer": _dlr, "BWICs": 0, "Lines Bid": 0, "Won": 0, "Covered": 0, "Face Bid $MM": 0.0, "Face Won $MM": 0.0})
+                r["BWICs"] += 1
+                r["Lines Bid"] += _d.get("bids", 0)
+                r["Won"] += _d.get("won", 0)
+                r["Covered"] += _d.get("covered", 0)
+                r["Face Bid $MM"] += _d.get("face_bid", 0) / 1e6
+                r["Face Won $MM"] += _d.get("face_won", 0) / 1e6
+        for _dlr, r in _agg.items():
+            r["Win Rate"] = f"{100*r['Won']/max(r['Lines Bid'],1):.1f}%"
+            r["Face Bid $MM"] = round(r["Face Bid $MM"], 1)
+            r["Face Won $MM"] = round(r["Face Won $MM"], 1)
+            _stats_rows.append(r)
+        _stats_rows.sort(key=lambda x: -x["Won"])
+
+    _stats_df = pd.DataFrame(_stats_rows) if _stats_rows else pd.DataFrame()
+
+    mo.accordion({
+        "📊 Dealer participation stats (lifetime)": (
+            mo.vstack([
+                mo.md(f"_{len(_all_records)} BWIC(s) on record._"),
+                mo.ui.table(_stats_df, selection=None, page_size=30),
+            ])
+            if not _stats_df.empty
+            else mo.md("_No stats yet — click 'Log dealer stats' after awarding a BWIC._")
+        )
+    })
     return
 
 
