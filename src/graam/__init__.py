@@ -25,6 +25,19 @@ Quick start::
 
 from .analytics import BondAnalytics, compute_analytics, npv
 from .amortizer import generate_cashflows
+from .bwic_pricing import (
+    BwicLine,
+    BwicResult,
+    IntexScenario,
+    dm_price_table,
+    price_bwic,
+    price_bwic_line,
+)
+from .intex_loader import (
+    load_intex_dataframe,
+    load_intex_excel,
+    stream_from_records,
+)
 from .day_counters import Actual360, Actual365, ActualActualISDA, Thirty360Us, get_day_counter
 from .enums import (
     Compounding,
